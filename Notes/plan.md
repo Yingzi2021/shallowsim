@@ -1,31 +1,41 @@
 # My Plan 
 
-(1) Learn something about the process of LLM inference
+(1) background information
 
-> Core: prefill (Prompt) & decode (Generation) --> memory bound
+> - LLM inference process in general (👌)
+>   - prefill (Prompt) & decode (Generation) 
+>   - **memory bound(KV cache)**
 >
-> - LLM inference in general
+> - Different parallelism strategies (👌)
+>   - Data parallelism
+>   - Tensor parallelism
+>   - sequence parallelism
+>   - expert parallelism
 >
->   https://github.com/xlite-dev/Awesome-LLM-Inference
+> - Different attention mechanism (👌)
 >
->   https://huggingface.co/docs/transformers/v4.44.1/llm_optims#llm-inference-optimization
+>   - Multi-head attention (MHA)
 >
->   https://www.snowflake.com/guides/llm-inference/
->   https://arxiv.org/pdf/2404.14294
+>   - Multi-query attention(MQA)
 >
-> - Deepseek (MLA ?)
+>   - Group query attention(GQA)
 >
-> - GPT-like 
+>   - Multi-head latent attention(MLA)
 >
-> - Llama-like
+> - Architecture for specific LLMs
+>
+>   - DeepSeek: MoE & MLA (👌)
+>
+>   - GPT-like:
+>
+>   - Llama-like:
+>
+>   - Qwen series 
+>
+> 
 
-(2) Pipeline parallelism
-
-https://zhuanlan.zhihu.com/p/613196255
-
-(3) Run & analyze the code
+(2) Run & analyze the code
 
 
 
-(4) Add the implementation for GPT / Llama-like LLM
-
+(3) Add the implementation for GPT / Llama-like LLM
