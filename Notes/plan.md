@@ -26,15 +26,13 @@
 >
 >   - DeepSeek: MoE & MLA (👌)
 >
->   - GPT-like:
+>   - Llama-3(👌)
 >
->   - Llama-like:
->
->   - Qwen series 
+>   - Qwen series(👌) 
 >
 > 
 
-(2) Run & analyze the code
+(2) Run & analyze the code (👌)
 
 
 
