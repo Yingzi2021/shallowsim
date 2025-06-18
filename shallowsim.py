@@ -9,6 +9,8 @@ from functools import reduce
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple, Optional, Literal
+from pathlib import Path
+from typing import Union
 
 cm = sns.light_palette("red", as_cmap=True)
 NVL_GPU_LIST = [72, 144, 576]
@@ -36,6 +38,13 @@ class ModelArgs:
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
     v_head_dim: int = 128
+
+    # mqa
+    # NEW ------------------------------
+    # for GQA / MQA (KV shared)
+    num_key_value_heads: int = n_heads   # default = same as n_heads
+    # ----------------------------------
+
     # yarn
     original_seq_len: int = 4096
     rope_theta: float = 10000.0
@@ -44,12 +53,63 @@ class ModelArgs:
     beta_slow: int = 1
     mscale: float = 1.
 
+    is_moe: bool = True  # whether this model is a MOE model
+    attention: Literal["mla", "gqa"] = "mla"  # attention type, default is MLA
+
+    @classmethod
+    def load_from_csv(cls,
+                 csv_path: Union[str, Path],
+                 model_name: str,
+                 case_sensitive: bool = False) -> "ModelArgs":
+        """
+        Create a ModelArgs instance by reading one row from a CSV.
+
+        Parameters
+        ----------
+        csv_path : str | Path
+            CSV file; must contain a 'model_name' column.
+        model_name : str
+            Which row to load.
+        case_sensitive : bool, default False
+            Match 'model_name' in a case–insensitive way if False.
+        """
+        import pandas as pd
+        from pathlib import Path
+
+        df = pd.read_csv(Path(csv_path).expanduser().resolve())
+
+        if "model_name" not in df.columns:
+            raise ValueError(f"'model_name' column missing in {csv_path}")
+
+        mask = df["model_name"] == model_name if case_sensitive \
+               else df["model_name"].str.lower() == model_name.lower()
+
+        if mask.sum() == 0:
+            raise KeyError(f"model_name='{model_name}' not found in {csv_path}")
+
+        row = df[mask].iloc[0].to_dict()
+
+        # 1) start from default DeepSeek template
+        args = cls()
+
+        # 2) override with CSV values
+        for k, v in row.items():
+            if k == "model_name" or not hasattr(args, k):
+                continue
+            try:
+                target_type = type(getattr(args, k))
+                setattr(args, k, target_type(v))
+            except (ValueError, TypeError):
+                # blank / NaN cells keep default
+                pass
+        return args
+
 
 class Config:
     seq_len = 4383
     decode_len = 1210
     kv_cache_rate = 0.563
-    decode_len = 1210
+    # decode_len = 1210
     bs_list = [16, 32, 64, 128, 256, 512]
     eplist = [8, 16, 36, 72, 144, 320]
 
@@ -282,12 +342,130 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
     for key in gpu_dict.keys():
         tp1, tp_list = mla_elapse_time(args, gpu_dict[key],
                                        seq_len, kv_cache_rate,
-                                       tp=[4, 8],
+                                       tp=[4, 8], #改成[1,4,8]?目前使用tp1,实际上少了一个mla static time
                                        decoding_mode=False,
                                        enable_gemm_fp4=True,
                                        print_console=print_console)
         df.loc[len(df)] = [gpu_dict[key].gpu_type, tp1] + \
             list(tp_list.values())
+    if print_console:
+        print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
+    return df
+
+# todo: gqa_dense_flops,gqa_dense_mem,gqa_dense_elapse_time,prefill_gqa,decode_gqa
+def gqa_dense_flops(q_len: int,
+                    kv_len: int,
+                    args: ModelArgs,
+                    kv_cache_rate: float):
+    """
+    Return (total FLOPs, GEMM-FP8 FLOPs, ATT-FP16 FLOPs)  [GFLOPs]
+
+    * Q/K/V/WO projection assumed FP8 GEMM
+    * QK matmul & Score*V part assumed FP16
+    * `kv_cache_rate` == 1.0 ⇒ all KV fetched from cache, projection FLOPs = 0
+    """
+    head_dim = args.dim // args.n_heads
+    kv_heads = args.num_key_value_heads or args.n_heads
+    group_size = args.n_heads // kv_heads
+
+    # -- FP8 GEMM: Q/K/V/WO projection  ---------------------------------
+    q_proj = q_len * args.dim * args.dim
+    # Only cache-miss part of K/V has to be projected
+    kv_proj = kv_len * args.dim * args.dim * (1 - kv_cache_rate) * 2
+    wo_proj = q_len * args.dim * args.dim
+    gemm_fp8 = (q_proj + kv_proj + wo_proj) * 2 / 1e9
+
+    # -- FP16 ATTENTION  -------------------------------------------------
+    qk_score = q_len * kv_len * head_dim * args.n_heads
+    score_v  = q_len * kv_len * head_dim * kv_heads
+    att_fp16 = (qk_score + score_v) * 2 / 1e9
+
+    return gemm_fp8 + att_fp16, gemm_fp8, att_fp16
+
+
+def gqa_dense_mem(args: ModelArgs):
+    """
+    Rough parameter size (MB) for Q/K/V/WO projection weights.
+    """
+    proj_bytes = 4 * args.dim * args.dim   # four weight matrices
+    return proj_bytes / 1024 / 1024
+
+
+def gqa_dense_elapse_time(args: ModelArgs,
+                          gpu: GPU_perf,
+                          seq_len: int,
+                          kv_cache_rate: float,
+                          tp=(1, 4, 8),
+                          decoding_mode: bool = True,
+                          batchsize: int = 1,
+                          enable_gemm_fp4: bool = True,
+                          dense_discount: float = 0.8,
+                          static_kernel_time: float = 0.05,
+                          min_ar_time: float = 0.015,
+                          print_console: bool = False):
+    """
+    Timing model for Dense-GQA Attention (no MoE).
+
+    Returns
+    -------
+    base_time_tp1_ms, {tp: elapsed_ms}
+    """
+    if decoding_mode:      # q_len = 1, KV fully cached
+        _, gemm, att = gqa_dense_flops(
+            1, seq_len, args, kv_cache_rate=1.0)
+        gemm *= batchsize
+        att  *= batchsize
+    else:                  # pre-fill
+        _, gemm, att = gqa_dense_flops(
+            seq_len, seq_len, args, kv_cache_rate)
+
+    # Compute time
+    if enable_gemm_fp4 and gpu.get_fp4_flops() != 0:
+        gemm_t = gemm / gpu.get_fp4_flops()
+    else:
+        gemm_t = gemm / gpu.get_fp8_flops()
+    gemm_t /= dense_discount
+    att_t   = att  / gpu.get_fp16_flops() / dense_discount
+    load_t  = gqa_dense_mem(args) / gpu.get_mem_bw()
+    base_t  = gemm_t + att_t + load_t     # TP=1
+
+    # All-Reduce latency (tensor-parallel)
+    ar_len  = batchsize if decoding_mode else seq_len
+    ar_size = ar_len * args.dim * 2 / 1024 / 1024      # FP16 = 2 bytes
+    ar_t    = ar_size / gpu.get_nvlink_bw() + min_ar_time
+
+    tp_time = {}
+    for tp_degree in tp:
+        tp_time[tp_degree] = (base_t / tp_degree +
+                              (0 if tp_degree == 1 else ar_t) +
+                              static_kernel_time)
+
+    if print_console:
+        print(f"[{gpu.gpu_type}] Dense-GQA base(ms): {base_t:.3f}")
+        for k, v in tp_time.items():
+            print(f"[{gpu.gpu_type}] TP{k:2d} time(ms): {v:.3f}")
+
+    return base_t, tp_time
+
+
+def prefill_gqa(args: ModelArgs,
+                gpu_dict: dict,
+                seq_len: int,
+                kv_cache_rate: float,
+                print_console: bool = False):
+    """
+    Prefill attention latency for Dense-GQA models.
+    """
+    df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
+    for key, gpu in gpu_dict.items():
+        tp1, tp_list = gqa_dense_elapse_time(
+            args, gpu,
+            seq_len=seq_len,
+            kv_cache_rate=kv_cache_rate,
+            tp=[1, 4, 8],
+            decoding_mode=False,
+            enable_gemm_fp4=True)
+        df.loc[len(df)] = [key, tp1] + list(tp_list.values())
     if print_console:
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
@@ -405,15 +583,33 @@ def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
 
 
 def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
-    dense_mla, tp_mla = mla_elapse_time(args, gpu,
-                                        seq_len, kv_cache_rate,
-                                        tp=[tp],
-                                        decoding_mode=False,
-                                        enable_gemm_fp4=True)
+    if args.attention == "mla":        # MoE-MLA
+        dense_att, tp_att = mla_elapse_time(
+            args, gpu,
+            seq_len, kv_cache_rate,
+            tp=[tp],
+            decoding_mode=False,
+            enable_gemm_fp4=True)
+    elif args.attention == "gqa":      # Dense-GQA
+        dense_att, tp_att = gqa_dense_elapse_time(
+            args, gpu,
+            seq_len, kv_cache_rate,
+            tp=[tp],
+            decoding_mode=False,
+            enable_gemm_fp4=True)
+    else:
+        raise ValueError(f"Unsupported attention type: {args.attention}")
+
     dense_mlp = _prefill_dense_mlp(args, gpu, seq_len)
-    shared, routed = _prefill_moe(args, gpu, seq_len, tp, dp)
-    dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp)
-    return dense_mla, dense_mlp, tp_mla[tp], shared, combine, routed, dispatch
+
+    # MoE-only parts ; skip when not MoE
+    if args.is_moe:
+        shared, routed = _prefill_moe(args, gpu, seq_len, tp, dp)
+        dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp)
+    else:
+        shared = routed = dispatch = combine = 0.0
+
+    return dense_att, dense_mlp, tp_att[tp], shared, combine, routed, dispatch
 
 
 def prefill_time(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, tp, dp, print_console=False):
@@ -503,6 +699,34 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
                 else:
                     df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
                                        load_kv_time, dense_mla, sparse_mla[tp_num]]
+    if print_console:
+        df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
+        print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
+    return df
+
+
+def decode_gqa(args: ModelArgs,
+               gpu_dict: dict,
+               bs_list,
+               seq_len: int,
+               decode_len: int,
+               print_console: bool = False):
+    """
+    Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
+    """
+    tp_list = [1, 4, 8]
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseGQA'])
+    for key, gpu in gpu_dict.items():
+        for bs in bs_list:
+            _, tp_time = gqa_dense_elapse_time(
+                args, gpu,
+                seq_len=seq_len,
+                kv_cache_rate=1.0,
+                tp=tp_list,
+                batchsize=bs,
+                decoding_mode=True)
+            for tp_degree in tp_list:
+                df.loc[len(df)] = [key, bs, tp_degree, tp_time[tp_degree]]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
