@@ -352,46 +352,81 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
 
-# todo: gqa_dense_flops,gqa_dense_mem,gqa_dense_elapse_time,prefill_gqa,decode_gqa
-def gqa_dense_flops(q_len: int,
+
+# add pp
+# add qwen / mistral support
+def gqa_flops(q_len: int,
                     kv_len: int,
                     args: ModelArgs,
                     kv_cache_rate: float):
     """
-    Return (total FLOPs, GEMM-FP8 FLOPs, ATT-FP16 FLOPs)  [GFLOPs]
+    FLOPs for one dense-GQA layer.
 
-    * Q/K/V/WO projection assumed FP8 GEMM
-    * QK matmul & Score*V part assumed FP16
-    * `kv_cache_rate` == 1.0 ⇒ all KV fetched from cache, projection FLOPs = 0
+    Parameters
+    ----------
+    q_len, kv_len : int
+        Current query / key-value sequence length.
+    kv_cache_rate : float
+        Fraction of KV already in cache (1.0 ⇒ full hit).
+
+    Returns
+    -------
+    total , GEMM_FP8_FLOPS , ATTN_FP16_FLOPS
     """
-    head_dim = args.dim // args.n_heads
-    kv_heads = args.num_key_value_heads or args.n_heads
-    group_size = args.n_heads // kv_heads
+    n_q  = args.n_heads                       # Query heads = h
+    n_kv = args.num_key_value_heads or n_q    # KV heads = g, if g = 1 then MQA, if g = h then MHA.
+    d_k  = d_v = args.dim // n_q              # per-head dim = d_k = d_v
+    d_model = args.dim                        # full model dim
 
-    # -- FP8 GEMM: Q/K/V/WO projection  ---------------------------------
-    q_proj = q_len * args.dim * args.dim
-    # Only cache-miss part of K/V has to be projected
-    kv_proj = kv_len * args.dim * args.dim * (1 - kv_cache_rate) * 2
-    wo_proj = q_len * args.dim * args.dim
-    gemm_fp8 = (q_proj + kv_proj + wo_proj) * 2 / 1e9
+    # FP8 GEMM  (Q, K, V projection) 
+    # Q: h × d_k  ←  d_model
+    q_proj_mac  = q_len * n_q  * d_k * d_model
+    # K/V: g × d_k  ←  d_model , but only cache-miss part
+    kv_proj_mac = kv_len * n_kv * d_k * d_model * 2          # K + V
+    kv_proj_mac *= (1.0 - kv_cache_rate)
+    gemm_sum = (q_proj_mac + kv_proj_mac)
 
-    # -- FP16 ATTENTION  -------------------------------------------------
-    qk_score = q_len * kv_len * head_dim * args.n_heads
-    score_v  = q_len * kv_len * head_dim * kv_heads
-    att_fp16 = (qk_score + score_v) * 2 / 1e9
+    # FP16 ATTENTION  (Q⊤K, softmax, Score·V, Wo) 
+    # Q⊤K: h × q_len × kv_len × d_k
+    qk_mac = n_q * q_len * kv_len * d_k
+    # Score·V : h × q_len × kv_len × d_v 
+    sv_mac = n_q * q_len * kv_len * d_v
+    # Wo : d_model × d_model
+    wo_mac = q_len * d_model * d_model
+    attn_sum = (qk_mac + sv_mac + wo_mac)
 
-    return gemm_fp8 + att_fp16, gemm_fp8, att_fp16
+    # return flops by 2* Sum(MACs)
+    GEMM_FP8_FLOPS = gemm_sum * 2/1e9
+    ATTN_FP16_FLOPS = attn_sum * 2/1e9
+
+    total = GEMM_FP8_FLOPS + ATTN_FP16_FLOPS
+    return total, GEMM_FP8_FLOPS, ATTN_FP16_FLOPS
 
 
-def gqa_dense_mem(args: ModelArgs):
+
+def gqa_mem(args: ModelArgs):
     """
-    Rough parameter size (MB) for Q/K/V/WO projection weights.
+    Parameter footprint (MiB) for one GQA layer (FP16 by default).
+
+    Q  : d_model x d_k         (h heads)      -> dim x dim
+    K,V: d_model x d_k x kv_ratio            -> dim x dim x (g/h)
+    Wo : d_model x d_model                   -> dim x dim
     """
-    proj_bytes = 4 * args.dim * args.dim   # four weight matrices
-    return proj_bytes / 1024 / 1024
+    g = args.num_key_value_heads or args.n_heads
+    d_model = args.dim
+    d_k = d_model // args.n_heads # = d_v
+
+    w_q  = d_model * d_k #  = dim × dim
+    w_kv = d_model * d_k * (g / args.n_heads) * 2 #  K + V
+    w_o  = d_model * d_model
+
+    total_params = w_q + w_kv + w_o
+
+    return total_params / 1024 / 1024         # → MiB
 
 
-def gqa_dense_elapse_time(args: ModelArgs,
+
+def gqa_elapse_time(args: ModelArgs,
                           gpu: GPU_perf,
                           seq_len: int,
                           kv_cache_rate: float,
@@ -411,23 +446,25 @@ def gqa_dense_elapse_time(args: ModelArgs,
     base_time_tp1_ms, {tp: elapsed_ms}
     """
     if decoding_mode:      # q_len = 1, KV fully cached
-        _, gemm, att = gqa_dense_flops(
+        _, gemm_flops, attn_fp16_flops = gqa_flops(
             1, seq_len, args, kv_cache_rate=1.0)
-        gemm *= batchsize
-        att  *= batchsize
-    else:                  # pre-fill
-        _, gemm, att = gqa_dense_flops(
+        gemm_flops *= batchsize
+        attn_fp16_flops *= batchsize
+    else:                  # prefill
+        _, gemm_flops, attn_fp16_flops = gqa_flops(
             seq_len, seq_len, args, kv_cache_rate)
 
     # Compute time
     if enable_gemm_fp4 and gpu.get_fp4_flops() != 0:
-        gemm_t = gemm / gpu.get_fp4_flops()
+        gemm_t = gemm_flops / gpu.get_fp4_flops()
     else:
-        gemm_t = gemm / gpu.get_fp8_flops()
+        gemm_t = gemm_flops / gpu.get_fp8_flops()
     gemm_t /= dense_discount
-    att_t   = att  / gpu.get_fp16_flops() / dense_discount
-    load_t  = gqa_dense_mem(args) / gpu.get_mem_bw()
-    base_t  = gemm_t + att_t + load_t     # TP=1
+    att_t   = attn_fp16_flops / gpu.get_fp16_flops() / dense_discount
+
+    # load weight
+    load_t  = gqa_mem(args) / gpu.get_mem_bw()
+    total  = gemm_t + att_t + load_t     # TP=1
 
     # All-Reduce latency (tensor-parallel)
     ar_len  = batchsize if decoding_mode else seq_len
@@ -436,16 +473,16 @@ def gqa_dense_elapse_time(args: ModelArgs,
 
     tp_time = {}
     for tp_degree in tp:
-        tp_time[tp_degree] = (base_t / tp_degree +
+        tp_time[tp_degree] = (total / tp_degree +
                               (0 if tp_degree == 1 else ar_t) +
                               static_kernel_time)
 
     if print_console:
-        print(f"[{gpu.gpu_type}] Dense-GQA base(ms): {base_t:.3f}")
+        print(f"[{gpu.gpu_type}] Dense-GQA total(ms): {total:.3f}")
         for k, v in tp_time.items():
             print(f"[{gpu.gpu_type}] TP{k:2d} time(ms): {v:.3f}")
 
-    return base_t, tp_time
+    return total, tp_time
 
 
 def prefill_gqa(args: ModelArgs,
@@ -458,7 +495,7 @@ def prefill_gqa(args: ModelArgs,
     """
     df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
     for key, gpu in gpu_dict.items():
-        tp1, tp_list = gqa_dense_elapse_time(
+        tp1, tp_list = gqa_elapse_time(
             args, gpu,
             seq_len=seq_len,
             kv_cache_rate=kv_cache_rate,
@@ -591,7 +628,7 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
             decoding_mode=False,
             enable_gemm_fp4=True)
     elif args.attention == "gqa":      # Dense-GQA
-        dense_att, tp_att = gqa_dense_elapse_time(
+        dense_att, tp_att = gqa_elapse_time(
             args, gpu,
             seq_len, kv_cache_rate,
             tp=[tp],
@@ -612,53 +649,165 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
     return dense_att, dense_mlp, tp_att[tp], shared, combine, routed, dispatch
 
 
-def prefill_time(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, tp, dp, print_console=False):
-    df = pd.DataFrame(columns=['GPU', 'MLA', 'DenseMLP', 'TP_MLA', 'Shared Expert',
-                      'Combine', 'Overlap1', 'Routed Expert', 'Dispatch', 'Overlap2'])
-    df2 = pd.DataFrame(columns=['GPU', 'Compute', 'Comm', 'Sum'])
+# ------------------------------------------------------------------
+#  Prefill-stage layer-wise timing table
+#  • MoE-MLA  → original wide table (with Shared / Routed / A2A columns)
+#  • Dense-GQA→ compact table (only MLA-type and DenseMLP columns)
+# ------------------------------------------------------------------
+def prefill_time(args: ModelArgs,
+                 gpu_dict: dict,
+                 seq_len: int,
+                 kv_cache_rate: float,
+                 tp: int,
+                 dp: int,
+                 print_console: bool = False):
+    """
+    Returns
+    -------
+    detail_df : layer-wise timing table (rows = metrics / cols = GPU)
+    summary_df: summed compute / comm / total time (rows = metrics / cols = GPU)
+    """
+    if args.attention == "mla":              # MoE MLA (DeepSeek-V3 style)
+            att_col       = "MLA"                # dense-layer MLA timing
+            tp_att_col    = "TP_MLA"             # TP-parallel sparse MLA
+    elif args.attention == "gqa":            # Dense GQA (Llama-3 style)
+        att_col       = "GQA"                # dense-layer GQA timing
+        tp_att_col    = "TP_GQA"
+    else:
+        raise ValueError(f"Unknown attention type: {args.attention}")
+
+
+    # ---------- 1.  column layout depends on model type ----------
+    if args.is_moe:                                          # MoE-MLA branch
+        col_order = ['GPU', att_col, 'DenseMLP', tp_att_col,
+                     'Shared Expert', 'Combine', 'Overlap1',
+                     'Routed Expert', 'Dispatch', 'Overlap2']
+    else:                                                    # Dense-GQA branch
+        col_order = ['GPU', att_col, 'DenseMLP', tp_att_col] # change name 'MLA' according to args.attention
+
+    detail_df  = pd.DataFrame(columns=col_order)
+    summary_df = pd.DataFrame(columns=['GPU', 'Compute', 'Comm', 'Sum'])
+
+    # layer split
     n_sparse_layers = args.n_layers - args.n_dense_layers
-    df.loc[len(df)] = ['Layers', args.n_dense_layers, args.n_dense_layers,  # MLA+ DenseMLP
-                       n_sparse_layers, n_sparse_layers, n_sparse_layers, n_sparse_layers,
-                       n_sparse_layers, n_sparse_layers, n_sparse_layers]
-    for key in gpu_dict.keys():
-        dense_mla, dense_mlp, tp_mla, shared, combine, routed, dispatch = _prefill_time(
-            args, gpu_dict[key], seq_len, kv_cache_rate, tp, dp)
-        overlap1 = combine - (tp_mla + shared)
-        overlap2 = dispatch - routed
-        df.loc[len(df)] = [key, dense_mla, dense_mlp, tp_mla, shared,
-                           combine, overlap1, routed, dispatch, overlap2]
-        comp_time = args.n_dense_layers * \
-            (dense_mla + dense_mlp) + n_sparse_layers * (tp_mla + shared + routed)
-        comm_time = n_sparse_layers * (combine + dispatch)
-        sum_time = comp_time
-        if overlap1 > 0:
-            sum_time += overlap1 * n_sparse_layers
-        if overlap2 > 0:
-            sum_time += overlap2 * n_sparse_layers
-        df2.loc[len(df2)] = [key, comp_time, comm_time, sum_time]
-    df = df.set_index('GPU').T
-    df2 = df2.set_index('GPU').T
+
+    # ------------- HEADER ROW  (layer counts) --------------------
+    layer_row = ['Layers',
+                 args.n_dense_layers,          # MLA (dense attention)
+                 args.n_dense_layers,          # Dense MLP
+                 n_sparse_layers]              # TP-MLA (sparse att)
+    if args.is_moe:
+        layer_row += [n_sparse_layers, n_sparse_layers, n_sparse_layers,
+                      n_sparse_layers, n_sparse_layers, n_sparse_layers]
+    detail_df.loc[len(detail_df)] = layer_row
+
+    # ------------- PER-GPU CALCULATION ---------------------------
+    for key, gpu in gpu_dict.items():
+        attn, dmlp, tp_attn, shared, combine, routed, dispatch = _prefill_time(
+            args, gpu, seq_len, kv_cache_rate, tp, dp) # rename 'mla' to 'attn'?
+
+        # ---- overlap only meaningful for MoE ----
+        overlap1 = combine - (tp_attn + shared) if args.is_moe else 0.0
+        overlap2 = dispatch - routed          if args.is_moe else 0.0
+
+        row = [key, attn, dmlp, tp_attn]
+        if args.is_moe:
+            row += [shared, combine, overlap1, routed, dispatch, overlap2]
+        detail_df.loc[len(detail_df)] = row
+
+        # ---- summary (per GPU) ---------------------------------
+        comp_time = args.n_dense_layers * (attn + dmlp)
+        if args.is_moe:
+            comp_time += n_sparse_layers * (tp_attn + shared + routed)
+
+        comm_time = n_sparse_layers * (combine + dispatch) if args.is_moe else 0.0
+        total_time = comp_time
+        if args.is_moe:
+            if overlap1 > 0:
+                total_time += overlap1 * n_sparse_layers
+            if overlap2 > 0:
+                total_time += overlap2 * n_sparse_layers
+
+        summary_df.loc[len(summary_df)] = [key, comp_time, comm_time, total_time]
+
+    # ------------- formatting / print ----------------------------
+    detail_df  = detail_df.set_index('GPU').T
+    summary_df = summary_df.set_index('GPU').T
+
     if print_console:
-        df['Layers'] = df['Layers'].astype(int).astype(str)
-        print(df.to_markdown(floatfmt=".3f"))
+        detail_df['Layers'] = detail_df['Layers'].astype(int).astype(str)
+        print(detail_df.to_markdown(floatfmt=".3f"))
         print('-----------SUM-------------')
-        print(df2.to_markdown(floatfmt=".3f"))
-    return df, df2
+        print(summary_df.to_markdown(floatfmt=".3f"))
+
+    return detail_df, summary_df
+
 
 # Decoding
 
+# ------------------------------------------------------------------
+#  Max batch size that fits one GPU during *decoding* (KV-cache live)
+# ------------------------------------------------------------------
+def _decoding_batchsize(args: ModelArgs,
+                        gpu: GPU_perf,
+                        seq_len: int,
+                        decode_len: int,
+                        tp: int,
+                        expert_num: int):
+    """
+    Parameters
+    ----------
+    tp          : tensor-parallel degree (heads are sharded)
+    expert_num  : routed experts *per device*  (0 for dense models)
 
-def _decoding_batchsize(args: ModelArgs, gpu: GPU_perf, seq_len, decode_len, tp, expert_num):
-    mem_util_rate = 0.9  # torch/activation等其它开销的折扣
-    mla = 187.17  # MLA的参数(单位M)
-    expert_mem = 44.05  # expert的参数(单位M)
-    others_parameter = 2.91  # 其它参数2.91GB
-    kv_cache = (seq_len+decode_len) * (args.kv_lora_rank +
-                                       args.qk_rope_head_dim) * args.n_layers * tp
-    mem = gpu.mem * mem_util_rate - others_parameter - mla * args.n_layers/tp/1024
-    mem -= expert_mem * \
-        (args.n_layers - args.n_dense_layers) * expert_num / 1024
-    return mem * 1024 * 1024 * 1024 / kv_cache
+    Returns
+    -------
+    max_bs (float) - largest batch size that fits GPU memory
+    """
+
+    # ---------------- 1. CONSTANTS & RESERVES -------------------
+    mem_util_rate   = 0.90      # keep 10 % headroom for activations, misc
+    others_gib      = 2.91      # torch, embeddings, buffers   (GiB)
+    mla_param_mb    = 187.17    # per-layer MLA parameter size  (MiB)
+    expert_param_mb = 44.05     # per-layer MoE expert size     (MiB)
+
+    if args.attention == "mla":
+        attn_param_mb = mla_param_mb  # per-layer MLA parameter size  (MiB)
+    elif args.attention == "gqa":
+        attn_param_mb = gqa_mem(args)
+    else:
+        raise ValueError(f"Unsupported attention type '{args.attention}'")
+    # ---------------- 2. PARAMETER FOOTPRINT -------------------
+    param_mb = attn_param_mb * args.n_layers / tp           # all MLA/Dense layers
+    if args.is_moe and expert_num > 0:
+        moe_layers = args.n_layers - args.n_dense_layers
+        param_mb  += expert_param_mb * moe_layers * expert_num
+
+    # ---------------- 3. KV-CACHE size / token -----------------
+    if args.attention == "mla":
+        # MLA kernel stores LoRA-KV  (fp8) + RoPE shift (fp16) per token
+        kv_bytes_per_tok = (args.kv_lora_rank + args.qk_rope_head_dim)
+    else:   # "gqa" or generic MHA
+        head_dim  = args.dim // args.n_heads
+        kv_heads  = args.num_key_value_heads or args.n_heads
+        kv_bytes_per_tok = head_dim * kv_heads * 2   # K+V, fp16 → 2 bytes
+
+    if kv_bytes_per_tok == 0:
+        raise ValueError("KV bytes per token computed as 0 – check model args.")
+
+    total_tokens    = seq_len + decode_len
+    kv_cache_bytes  = total_tokens * kv_bytes_per_tok * args.n_layers * tp
+
+    # ---------------- 4. AVAILABLE GPU MEMORY ------------------
+    usable_gib      = gpu.mem * mem_util_rate - others_gib - param_mb / 1024
+    usable_bytes    = usable_gib * 1024 ** 3            # GiB → Bytes
+    if usable_bytes <= 0:
+        return 0.0
+
+    # ---------------- 5. MAX BATCH SIZE ------------------------
+    max_bs = usable_bytes / kv_cache_bytes
+    return max_bs
+
 
 
 def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
@@ -690,7 +839,7 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
                                                     tp=tp_list,
                                                     batchsize=bs,
                                                     decoding_mode=True,
-                                                    enable_gemm_fp4=True)
+                                                    enable_gemm_fp4=True) # here.
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
@@ -715,18 +864,22 @@ def decode_gqa(args: ModelArgs,
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
     tp_list = [1, 4, 8]
-    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseGQA'])
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP',
+                               'LoadKV', 'DenseGQA'])
     for key, gpu in gpu_dict.items():
         for bs in bs_list:
-            _, tp_time = gqa_dense_elapse_time(
-                args, gpu,
-                seq_len=seq_len,
-                kv_cache_rate=1.0,
-                tp=tp_list,
-                batchsize=bs,
-                decoding_mode=True)
-            for tp_degree in tp_list:
-                df.loc[len(df)] = [key, bs, tp_degree, tp_time[tp_degree]]
+            # --- KV-Cache load ---
+            kv_bytes = seq_len * (args.dim // args.n_heads) * args.num_key_value_heads
+            kv_bytes *= bs            # tokens
+            load_kv = kv_bytes / 1024/1024 / 1024 / gpu.get_mem_bw() * 1000  # ms
+
+            # --- Attention kernel ---
+            _, tp_time = gqa_elapse_time(
+                args, gpu, seq_len, 1.0, tp=tp_list,
+                batchsize=bs, decoding_mode=True)
+            for tp in tp_list:
+                df.loc[len(df)] = [key, bs, tp, load_kv, tp_time[tp]]
+    
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
@@ -919,34 +1072,100 @@ def decode_a2a(args: ModelArgs, gpu_dict,
     return df
 
 
-def _decode_time(args: ModelArgs, gpu,
-                 bs_list, seq_len, decode_len,
+# ------------------------------------------------------------------
+#  Per–layer decode-time table for one GPU
+#  • Branch = MoE   →   use MLA + Expert + A2A paths
+#  • Branch = Dense →   use Dense-attention path only
+# ------------------------------------------------------------------
+def _decode_time(args: ModelArgs,
+                 gpu: GPU_perf,
+                 bs_list,
+                 seq_len,
+                 decode_len,
                  gemm_group_per_device,
                  device_num,
-                 mbs=2,
-                 fp8_combine=False,
-                 print_console=False):
+                 mbs: int = 2,
+                 fp8_combine: bool = False,
+                 print_console: bool = False):
 
-    expert_per_device = gemm_group_per_device + 1  # add shared expert
-    mla = decode_mla(args, gpu, bs_list, seq_len,
-                     decode_len, expert_num=expert_per_device)
-    dense_mlp = decode_dense_mlp(
-        args, gpu, bs_list, seq_len, decode_len, expert_num=expert_per_device)
-    moe = decode_moe_expert(args, gpu, bs_list, seq_len,
-                            decode_len, mbs=mbs,
-                            gemm_group_per_device=gemm_group_per_device,
-                            device_num=device_num)
-    a2a = decode_a2a(args, gpu, bs_list, seq_len, decode_len,
-                     expert_num=expert_per_device, device_num= device_num,
-                     fp8_combine=fp8_combine, mbs=mbs)
-    dfs = [mla, dense_mlp, moe, a2a]
+    # ------------------------------------------------------------
+    # Common helpers
+    # ------------------------------------------------------------
+    base_keys       = ['GPU', 'BatchSize', 'TP']   # merge keys
+    att_label       = "MLA" if args.attention == "mla" else "GQA"
+    tp_list         = [1, 4, 8]                    # default TP sweep
 
-    for decode_df in dfs:
-        decode_df['BatchSize'] = decode_df['BatchSize'].astype(int).astype(str)
-    df = reduce(lambda left, right: pd.merge(left, right, on=[
-                'GPU', 'BatchSize', 'TP'], how='left'), dfs)
+    # ============================================================
+    # 1.  NON-MoE   (pure dense, e.g. Llama-3)
+    # ============================================================
+    if not args.is_moe:
+        # 1-A  Attention  (includes Load-KV latency)
+        if args.attention == "gqa":
+            att_df = decode_gqa(args, gpu,
+                                bs_list, seq_len, decode_len)
+            # rename for uniform downstream column usage
+            # att_df = att_df.rename(columns={"DenseGQA": "SparseMLA"})
+        else:          # dense MLA kernel (rare but supported)
+            att_df = decode_mla(args, gpu,
+                                bs_list, seq_len, decode_len,
+                                expert_num=0)         # no experts
+            #att_df = att_df.rename(columns={"DenseMLA": "SparseMLA"})
+
+        # 1-B  Dense-MLP
+        dmlp_df = decode_dense_mlp(args, gpu,
+                                   bs_list, seq_len, decode_len,expert_num=0)
+
+        # 1-C  merge and zero-fill missing MoE/A2A columns
+        df = pd.merge(att_df[base_keys + ['LoadKV', 'Dense'+att_label]],
+                      dmlp_df[base_keys + ['DenseMLP']],
+                      on=base_keys, how='left')
+
+        # Dense-side: DenseMLA  = SparseMLA,   SparseMLA reset to 0
+        # df['Dense'+att_label]  = df['Sparse'+att_label]
+        df['Sparse'+att_label] = 0.0
+
+        for col in ['SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine']:
+            df[col] = 0.0
+
+        col_order = ['GPU', 'BatchSize', 'TP',
+                     'LoadKV', 'Dense'+att_label, 'Sparse'+att_label, 'DenseMLP',
+                     'SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine']
+        df = df[col_order]
+        df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
+
+        if print_console:
+            print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
+        return df
+
+    # ============================================================
+    # 2.  MoE-MLA   (e.g. DeepSeek-V3, Qwen-3)
+    # ============================================================
+    expert_per_device = gemm_group_per_device + 1  # routed + shared
+
+    mla_df  = decode_mla(args, gpu, bs_list, seq_len,
+                         decode_len, expert_num=expert_per_device)
+    dmlp_df = decode_dense_mlp(args, gpu, bs_list, seq_len,
+                               decode_len, expert_num=expert_per_device)
+    moe_df  = decode_moe_expert(args, gpu, bs_list, seq_len,
+                                decode_len, mbs=mbs,
+                                gemm_group_per_device=gemm_group_per_device,
+                                device_num=device_num)
+    a2a_df  = decode_a2a(args, gpu, bs_list, seq_len, decode_len,
+                         expert_num=expert_per_device,
+                         device_num=device_num,
+                         fp8_combine=fp8_combine, mbs=mbs)
+
+    dfs = [mla_df, dmlp_df, moe_df, a2a_df]
+    for d in dfs:
+        d['BatchSize'] = d['BatchSize'].astype(int).astype(str)
+
+    df = reduce(lambda l, r: pd.merge(l, r,
+                                      on=['GPU', 'BatchSize', 'TP'],
+                                      how='left'), dfs)
+
     if print_console:
-        print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
+        print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
+
     return df
 
 
@@ -968,20 +1187,30 @@ def decode_time(args: ModelArgs, gpu_dict,
             return r['TPOT_O'] + r['Delta'] * (args.n_layers - args.n_dense_layers)
         else:
             return r['TPOT_O']
+    
+    attn_type = args.attention.upper()
 
-    # 修正TP执行时间, 按照加载FP8的KV计算
-    df['DenseMLA'] = df['DenseMLA'] + df['LoadKV']
-    df['SparseMLA'] = df['SparseMLA'] + df['LoadKV']
-    df['COMP_SUM'] = df['SparseMLA'] + df['SharedExpert'] + df['RoutedExpert']
-    df['COMM_SUM'] = df['Dispatch'] + df['Combine']
-    df['Delta'] = df['COMM_SUM'] - df['SparseMLA'] - df['SharedExpert']
-    df['TPOT_O'] = (df['DenseMLA'] + df['DenseMLP']) * args.n_dense_layers
-    df['TPOT_O'] += (df['SparseMLA'] + df['SharedExpert'] +
-                     df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
+    if args.is_moe:
+        # 修正TP执行时间, 按照加载FP8的KV计算
+        df['Dense'+ attn_type] = df['Dense'+ attn_type] + df['LoadKV']
+        df['Sparse'+ attn_type] = df['Sparse'+ attn_type] + df['LoadKV']
+        df['COMP_SUM'] = df['Sparse'+ attn_type] + df['SharedExpert'] + df['RoutedExpert']
+        df['COMM_SUM'] = df['Dispatch'] + df['Combine']
+        df['Delta'] = df['COMM_SUM'] - df['Sparse'+ attn_type] - df['SharedExpert']
+        df['TPOT_O'] = (df['Dense'+ attn_type] + df['DenseMLP']) * args.n_dense_layers
+        df['TPOT_O'] += (df['Sparse'+ attn_type] + df['SharedExpert'] +
+                        df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
+    else: # pure dense model, no moe communication
+        df['Dense'+ attn_type] = df['Dense'+ attn_type] + df['LoadKV']
+        df['COMP_SUM'] = df['Sparse'+ attn_type] + df['SharedExpert'] + df['RoutedExpert'] # 0
+        df['COMM_SUM'] = df['Dispatch'] + df['Combine'] # 0
+        df['Delta'] = df['COMM_SUM'] - df['Sparse'+ attn_type] - df['SharedExpert'] # 0
+        df['TPOT_O'] = (df['Dense'+ attn_type] + df['DenseMLP']) * args.n_dense_layers
+
 
     df['TPOT'] = df.apply(lambda row:  overlap_adjust(row), axis=1)
-    df = df[['GPU', 'TP', 'BatchSize', 'DenseMLA', 'DenseMLP', 'SparseMLA', 'Combine',
-             'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O']]
+    df = df[['GPU', 'TP', 'BatchSize', 'Dense'+ attn_type, 'DenseMLP', 'Sparse'+ attn_type, 'Combine',
+                'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O']]
     df['TPS'] = 1000 / df['TPOT']
     df['TPS_O'] = 1000 / df['TPOT_O']
     df['Total'] = df['TPS'] * df['BatchSize'].astype(int)
@@ -989,6 +1218,7 @@ def decode_time(args: ModelArgs, gpu_dict,
     df['Comm_Impact'] = (df['Total_O'] - df['Total']) / df['Total_O']
 
     df = df[df['TPS'] > tps_limit]
+
     if print_console:
         print(df.set_index('GPU').T.to_markdown(floatfmt=".3f"))
     return df
@@ -999,6 +1229,9 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
                              tps_limit=0,
                              fp8_combine=False,
                              print_console=False):
+    if (not args.is_moe) or (args.is_moe and args.n_routed_experts == 0):
+        raise ValueError("n_routed_experts must be set for MoE models.")
+    
     df_list = []
     for device_num in config.eplist:
         gemm_group_per_device = math.ceil(args.n_routed_experts / device_num)
