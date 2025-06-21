@@ -599,9 +599,12 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
     load_time = moe_expert_mem(args) / gpu.get_mem_bw()
     gemm_flops = gpu.get_fp4_flops() if gpu.get_fp4_flops() != 0 else gpu.get_fp8_flops()
     num_device = tp * dp
-    num_shared_token = dp * seq_len / num_device
-    shared_flops = moe_expert_flops(args, num_shared_token)
-    shared_time = shared_flops / gemm_flops + load_time
+    if args.n_shared_experts > 0:
+        num_shared_token = dp * seq_len / num_device
+        shared_flops = moe_expert_flops(args, num_shared_token)
+        shared_time = shared_flops / gemm_flops + load_time
+    else:
+        shared_time = 0.0
 
     num_routed_token = seq_len * dp * args.n_activated_experts / num_device
     routed_flops = moe_expert_flops(args, num_routed_token)
@@ -970,7 +973,8 @@ def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
     tp_list = [1, 4, 8]
-    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA'])
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA','SparseGQA'])
+
     for key, gpu in gpu_dict.items():
         for bs in bs_list:
             # --- KV-Cache load ---
@@ -979,7 +983,7 @@ def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console
             load_kv = kv_bytes / 1024/1024 / 1024 / gpu.get_mem_bw() * 1000  # ms
 
             # --- Attention kernel ---
-            _, tp_time = gqa_elapse_time(
+            dense_gqa, sparse_gqa = gqa_elapse_time(
                 args, gpu, seq_len, 1.0, tp=tp_list,
                 batchsize=bs, decoding_mode=True)
             for tp in tp_list:
@@ -988,7 +992,7 @@ def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console
                 if bs > max_bs:
                     continue
                 else:
-                    df.loc[len(df)] = [key, bs, tp, load_kv, tp_time[tp]]
+                    df.loc[len(df)] = [key, bs, tp, load_kv, dense_gqa, sparse_gqa[tp]]
     
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
@@ -1248,12 +1252,15 @@ def _decode_time(args: ModelArgs,
         return df
 
     # ============================================================
-    # 2.  MoE-MLA   (e.g. DeepSeek-V3, Qwen-3)
+    # 2.  MoE   (e.g. DeepSeek-V3, Qwen-3)
     # ============================================================
     expert_per_device = gemm_group_per_device + 1  # routed + shared
 
-    mla_df  = decode_mla(args, gpu, bs_list, seq_len,
-                         decode_len, expert_num=expert_per_device)
+    if args.attention == "mla":  # MLA kernel
+        attn_df  = decode_mla(args, gpu, bs_list, seq_len,decode_len, expert_num=expert_per_device)
+    elif args.attention == "gqa":  # GQA kernel
+        attn_df  = decode_gqa(args, gpu, bs_list, seq_len, decode_len, print_console=False)
+    
     dmlp_df = decode_dense_mlp(args, gpu, bs_list, seq_len,
                                decode_len, expert_num=expert_per_device)
     moe_df  = decode_moe_expert(args, gpu, bs_list, seq_len,
@@ -1265,7 +1272,7 @@ def _decode_time(args: ModelArgs,
                          device_num=device_num,
                          fp8_combine=fp8_combine, mbs=mbs)
 
-    dfs = [mla_df, dmlp_df, moe_df, a2a_df]
+    dfs = [attn_df, dmlp_df, moe_df, a2a_df]
     for d in dfs:
         d['BatchSize'] = d['BatchSize'].astype(int).astype(str)
 
@@ -1342,6 +1349,8 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
     if (not args.is_moe) or (args.is_moe and args.n_routed_experts == 0):
         raise ValueError("n_routed_experts must be set for MoE models.")
     
+    attn_type = args.attention.upper()
+    
     df_list = []
     for device_num in config.eplist:
         gemm_group_per_device = math.ceil(args.n_routed_experts / device_num)
@@ -1356,7 +1365,7 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
         df_list.append(df)
     dd = pd.concat(df_list)
     dd.reset_index(inplace=True, drop=True)
-    order = ['GPU', 'TP', 'EP', 'BatchSize', 'DenseMLA', 'DenseMLP', 'SparseMLA',
+    order = ['GPU', 'TP', 'EP', 'BatchSize', 'Dense'+attn_type, 'DenseMLP', 'Sparse'+attn_type,
              'Combine', 'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM',
              'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O', 'TPS', 'TPS_O', 'Total',
              'Total_O', 'Comm_Impact']
