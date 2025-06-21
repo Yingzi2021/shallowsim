@@ -119,3 +119,99 @@ Input Token -> E1      E2      E3    ...    E4    (E1, E2 on GPU0; E3, E4 on GPU
 **Real-world implementations:** Expert parallelism has been implemented in frameworks like **DeepSpeed** (DeepSpeed-MoE) and **Megatron-LM** for training and inference of MoE models. For example, DeepSpeed’s MoE library allows specifying an “expert parallelism degree” to spread experts across GPUs, and uses a fast router to dispatch tokens. Google’s **GShard** (for the Switch Transformer) was an early implementation of expert slicing across devices. NVIDIA’s TensorRT-LLM and AWS SageMaker model parallel library also support expert parallelism for serving MoE models. These systems handle the complex communication under the hood: they route token embeddings to the correct GPU, run the expert forward, and gather results. In practice, if you use an MoE-based LLM with thousands of experts, you’d rely on these libraries to manage expert parallelism, since doing it manually would be very complex. Notably, expert parallelism can be combined with other parallel strategies (e.g., you could also shard each expert’s weights via tensor parallelism, though some frameworks treat these as mutually exclusive for simplicity). This approach has enabled models with trillions of parameters (comprised of many experts) to be deployed with reasonable inference speed, as only a small fraction of those parameters are active per input.
 
 **Conclusion:** All these parallelism strategies can be combined in various ways to serve large models efficiently. For instance, one could use data parallelism to handle many requests at once, while using tensor+sequence parallelism to shard a single model across GPUs, and expert parallelism if the model itself is an MoE. The choice of strategy depends on the model architecture and inference scenario. Data parallelism is simple and great for throughput (if the model fits on one device). Tensor and sequence parallelism address *scaling a single model* beyond one device’s limits (model size or sequence length). Expert parallelism enables scaling model *capacity* by using sparse activation. Modern LLM systems often employ a hybrid of these techniques to achieve both low latency and high throughput on specialized hardware. Each strategy comes with trade-offs in complexity and communication overhead, but together they make it feasible to deploy today’s enormous LLMs in practical settings.
+
+## Pipeline parallelism
+
+> a nice demonstration: fig 5 in paper *The Llama 3 Herd of Models* page 11
+
+Pipeline parallelism involves **sharding the model (vertically) into chunks**, where each chunk comprises **a subset of layers** that is executed on a separate device. Figure 2a is an illustration of four-way pipeline parallelism, where the model is sequentially partitioned and a quarter subset of all layers are executed on each device. **The outputs of a group of operations on one device are passed to the next**, which continues executing the subsequent chunk. ![F_n](https://s0.wp.com/latex.php?latex=F_n&bg=transparent&fg=000&s=0&c=20201002) and ![B_n](https://s0.wp.com/latex.php?latex=B_n&bg=transparent&fg=000&s=0&c=20201002) indicate forward and *backward* passes respectively on device n. The memory requirement for storing model weights on each device is effectively quartered.
+
+> Training?
+
+The main limitation of this method is that, due to the sequential nature of the processing, **some devices or layers may remain idle while waiting for the output** (activations, gradients) of previous layers. This results in inefficiencies or “**pipeline bubbles**” in both the forward and backward passes. In Figure 2b, the white empty areas are the large pipeline bubbles with naive pipeline parallelism where devices are idle and underutilized.
+
+**Microbatching** can mitigate this to some extent, as shown in Figure 2c. **The global batch size of inputs is split into sub-batches**, which are processed one by one, with gradients being accumulated at the end. Note that ![F_{n,m}](https://s0.wp.com/latex.php?latex=F_%7Bn%2Cm%7D&bg=transparent&fg=000&s=0&c=20201002) and ![B_{n,m}](https://s0.wp.com/latex.php?latex=B_%7Bn%2Cm%7D&bg=transparent&fg=000&s=0&c=20201002) indicate forward and backward passes respectively on device ![n](https://s0.wp.com/latex.php?latex=n&bg=transparent&fg=000&s=0&c=20201002) with microbatch ![m](https://s0.wp.com/latex.php?latex=m&bg=transparent&fg=000&s=0&c=20201002). This approach shrinks the size of pipeline bubbles, but it does not completely eliminate them.
+
+> Two new parameters
+>
+> - pipeline degree/depth;(four-way pipeline parallelism --> degree = 4)
+> - micro-batch size
+
+![](figs/four-way-pipeline-parallelism.png)
+
+| 概念/变量               | 论文/博客里常见名字 | 在示意图 (b) 里的对应 | 在 ShallowSim 新字段                  |
+| ----------------------- | ------------------- | --------------------- | ------------------------------------- |
+| **pipeline depth**      | # stage，way        | “4-way” 里的 4        | `pp_degree`                           |
+| **micro-batch**         | chunk, micro-batch  | F_{0,0}、F_{0,1} …    | `pp_chunks` 或函数参数 `micro_bs`     |
+| **fill / drain bubble** | pipeline bubble     | 图中白色梯形空档      | `_schedule_pipeline()` 里 `bubble_ms` |
+| **stage 计算时长**      | stage latency       | 彩块高度              | `stage_ts[i]`                         |
+| **steady-state步长**    | max (stage_ts)      | 一格框宽              | `max_t`                               |
+
+Pipeline parallelism is not typically efficient in decode phase. See the introduction of paper *SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills* for some details.
+
+为什么 **Pipeline Parallelism (PP)** 对 *推理-decode 阶段* 帮助有限？
+
+> **一句话**：生成 **每 1 个新 token** 都要重新把全部 pp 个stage 串一次——填充、排空的 “bubble” 每轮都出现，几乎抵消了stage 重叠带来的收益。
+
+**1 · Prefill vs Decode 调度对比**
+
+| 步骤           | Prefill（一次性推完整个 prompt）   | Decode（逐 token 生成）        |
+| -------------- | ---------------------------------- | ------------------------------ |
+| **填充 fill**  | 只发生 **一次**                    | **每个 token** 都要再填        |
+| **稳态重叠**   | `micro_batches – 1` 个周期真正并行 | 只有 0 或 1 个 token；重叠极少 |
+| **排空 drain** | 只发生 **一次**                    | 同样每 token 一次              |
+
+**2 · 直观示意**
+
+![](figs/32.png)
+
+*Prefill*：方块开始重叠后，GPU 利用率接近 100 %。
+
+![](figs/33.png)
+
+*Decode*：一旦排空，“下一 token” 又从头开始填；4 张 GPU 中有 ¾ 时间在等结果 → 加速几乎被泡沫抵消。
+
+**理论分析**
+
+| 场景                       | 总时长公式                                                   |
+| -------------------------- | ------------------------------------------------------------ |
+| **串行执行**（没有 PP）    | T_serial = p · M · T                                         |
+| **Pipeline + micro-batch** | T_pipe=(M+2(p−1))⋅T                                          |
+| **速度提升**               | \text{Speed-up} = \frac{T_\text{serial}}{T_\text{pipe}} = \frac{p·M}{M + 2(p-1)} |
+
+- **p** = `pp_degree` ( 4-way pipeline ⇒ p = 4 )
+- **M** = micro-batch 数 (`pp_chunks`)，把全局 batch 切成 M 片
+- **T** = *单个 stage* 处理 **一片** micro-batch 的时长（假设 p 个 stage 时长相近）
+
+> M-->∞，speed-up --> p 
+
+**3 · 什么时候 PP 对推理有用？**
+
+1. **高并发、多序列并行**
+    把不同用户的序列按 token 对齐交错送 pipeline（称 *pipeline-level interleaving* 或 *wave scheduling*）。
+2. **Speculative / look-ahead 解码**
+    一次推多 token；等验证阶段回滚。`N_token` 变大后泡沫占比下降。
+3. **大 `max_t`、深网络、小 TP**
+    硬件本身算一次 layer 很慢（如 CPU 或少 GPU），PP 能压缩绝对延迟。
+
+**4 · 如何在 ShallowSim 里表达这种现象？**
+
+1. **prefill_time_pp()**
+   - 泡沫只加一次：`bubble = 2·(pp-1)·max_t`.
+2. **decode_time_pp()**
+   - 每 token 付一次 bubble：
+      `total = (decode_len + pp - 1) · max_t`
+   - 在输出 DF 里保留 `Bubble`、`Total_PP` 两列，
+      方便可视化 “泡沫占比”。
+
+这样跑出来会看到：
+
+- Prefill Total_PP 显著小于原 Total；
+- Decode Total_PP 略小或几乎相同——验证了 “PP 在 decode 阶段收益不大”。
+
+**5 · 结论**
+
+- **推理前半（prefill）**：PP + micro-batch 能大幅压缩延迟；
+- **逐 token decode**：若不做跨请求 interleaving 或 speculative trick，
+   **加 Pipeline 的收益极其有限**——这也是为什么主流框架（FasterTransformer, vLLM）推理时更关注 **TensorParallel + KV-Cache 优化** 而不是 PP。
+
