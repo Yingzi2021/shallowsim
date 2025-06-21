@@ -965,18 +965,12 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
     return df
 
 
-def decode_gqa(args: ModelArgs,
-               gpu_dict: dict,
-               bs_list,
-               seq_len: int,
-               decode_len: int,
-               print_console: bool = False):
+def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console=False):
     """
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
     tp_list = [1, 4, 8]
-    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP',
-                               'LoadKV', 'DenseGQA'])
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA'])
     for key, gpu in gpu_dict.items():
         for bs in bs_list:
             # --- KV-Cache load ---
@@ -989,7 +983,12 @@ def decode_gqa(args: ModelArgs,
                 args, gpu, seq_len, 1.0, tp=tp_list,
                 batchsize=bs, decoding_mode=True)
             for tp in tp_list:
-                df.loc[len(df)] = [key, bs, tp, load_kv, tp_time[tp]]
+                max_bs = _decoding_batchsize(
+                        args, gpu, seq_len, decode_len,expert_num=0,tp=tp)
+                if bs > max_bs:
+                    continue
+                else:
+                    df.loc[len(df)] = [key, bs, tp, load_kv, tp_time[tp]]
     
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
