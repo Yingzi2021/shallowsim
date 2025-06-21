@@ -1373,7 +1373,6 @@ def decode_time_pp(args: 'ModelArgs',
                    gemm_group_per_device,
                    device_num,
                    pp: int,
-                   tp: int, dp: int,
                    tps_limit: int = 0,
                    fp8_combine: bool = False,
                    print_console: bool = False):
@@ -1411,9 +1410,10 @@ def decode_time_pp(args: 'ModelArgs',
                                           is_decode=True)
 
         # ---- write back results -------------------------------------
+        df.at[idx, 'PP']       = pp
         df.at[idx, 'Bubble']   = bubble
         df.at[idx, 'TPOT_PP']  = total_pp
-        df.at[idx, 'Speedup']  = serial_ms / total_pp     # >1 ⇒ faster
+        df.at[idx, 'Speedup']  = (serial_ms * total_tokens) / total_pp     # >1 ⇒ faster (bug!!!)
 
     if print_console:
         print("\n[Decode · Pipeline-parallel]")
