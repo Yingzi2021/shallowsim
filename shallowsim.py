@@ -11,6 +11,7 @@ import seaborn as sns
 from typing import Tuple, Optional, Literal
 from pathlib import Path
 from typing import Union
+from typing import List, Tuple
 
 cm = sns.light_palette("red", as_cmap=True)
 NVL_GPU_LIST = [72, 144, 576]
@@ -197,6 +198,53 @@ def gpu_category_idx(gpu_dict):
         gpu_category[key]=i
         i +=1
     return gpu_category
+
+
+# ---------------------------------------------------------------------------
+# 1. Utility – split L layers into `pp` stages (uniform-cost assumption)
+# ---------------------------------------------------------------------------
+def _uniform_split(total_layers: int, pp: int) -> List[int]:
+    """
+    Return a list of *layer counts* per pipeline stage.
+    e.g. 10 layers, pp = 4  ➜  [3, 3, 2, 2]
+    """
+    if pp < 1:
+        raise ValueError("pp must be ≥ 1")
+    base, rem = divmod(total_layers, pp)
+    return [base + 1 if i < rem else base for i in range(pp)]
+
+# ---------------------------------------------------------------------------
+# 2. Utility – GPipe latency model
+# ---------------------------------------------------------------------------
+def _gpipe_latency(stage_times: List[float],
+                   rounds: int,
+                   is_decode: bool) -> Tuple[float, float]:
+    """
+    stage_times : latency of each pipeline stage  (ms)
+    rounds      : number of micro-batches that will flow through
+                  · prefill →  rounds = micro_bs
+                  · decode  →  rounds = ceil(batch_size * tgt_len / pp)
+    is_decode   : True ⇒ one bubble *per round* (strict causal dep.)
+    ----------------------------------------------------------------
+    Returns (total_time_ms , bubble_time_ms)
+    """
+    pp = len(stage_times)
+    t_max = max(stage_times)
+
+    fill_drain = 2 * (pp - 1) * t_max          # ms
+
+    if is_decode:
+        steady_overlap = (rounds - 1) * (t_max * pp)   
+        bubble_repeat  = (rounds - 1) * fill_drain
+        total  = sum(stage_times) * rounds + bubble_repeat + fill_drain
+        bubble = fill_drain + bubble_repeat
+    else:
+        steady_overlap = (rounds - 1) * t_max
+        total  = sum(stage_times) + fill_drain + steady_overlap
+        bubble = fill_drain                       
+
+    return total, bubble
+
 
 # 非吸收的版本
 
@@ -743,6 +791,70 @@ def prefill_time(args: ModelArgs,
     return detail_df, summary_df
 
 
+# ---------------------------------------------------------------------------
+# 3. Public – Prefill with PP
+# ---------------------------------------------------------------------------
+def prefill_time_pp(args: 'ModelArgs',
+                    gpu_dict: dict,
+                    seq_len: int,
+                    kv_cache_rate: float,
+                    tp: int, dp: int,
+                    bs:int,
+                    pp: int, micro_bs: int,
+                    print_console: bool = False):
+    """
+    PP-aware drop-in replacement for `prefill_time`.
+
+    • `pp`        : pipeline degree (≥1)
+    • `micro_bs`  : micro-batches that form one *global* batch
+    """
+    detail, summary = prefill_time(args, gpu_dict, seq_len,
+                                   kv_cache_rate, tp, dp,
+                                   print_console=False)
+
+    if pp == 1:                       # fast path – nothing to do
+        if print_console:
+            print(summary.to_markdown(floatfmt='.3f'))
+        return detail, summary
+
+    L_per_stage = _uniform_split(args.n_layers, pp)
+
+    for gpu_name in summary.columns:
+        # 1) serial latency of one prompt
+        serial_one = float(summary.at['Sum', gpu_name])
+
+        # 2) derive per-stage timing  (uniform split)
+        micro_chunk = bs // micro_bs             # ≥1
+        stage_times = [serial_one * micro_chunk * (l / args.n_layers)
+                       for l in L_per_stage]
+
+        # ── pipeline latency for `micro_bs` chunks ─────────────────
+        total_pp, bubble = _gpipe_latency(stage_times,
+                                          micro_bs=micro_bs,
+                                          is_decode=False)
+
+        # 3) write Bubble / Total_PP rows
+        for row, val in (('Bubble',    bubble),
+                         ('Total_PP',  total_pp)):
+            if row not in summary.index:
+                summary.loc[row] = 0.0
+            summary.at[row, gpu_name] = val
+
+        # 4) serial_total & speed-up  (same GPU)
+        serial_total = serial_one * bs        # no PP baseline
+        speedup      = serial_total / total_pp 
+
+        for row, val in (('Serial_Total', serial_total),
+                         ('Speedup',      speedup)):
+            if row not in summary.index:
+                summary.loc[row] = 0.0
+            summary.at[row, gpu_name] = val
+
+    if print_console:
+        print("\n[Prefill · Pipeline-parallel]")
+        print(summary.to_markdown(floatfmt='.3f'))
+    return detail, summary
+
 # Decoding
 
 # ------------------------------------------------------------------
@@ -1253,6 +1365,62 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
     dd = dd[order]
     dd['BatchSize'] = dd['BatchSize'].astype(int)
     return dd
+
+def decode_time_pp(args: 'ModelArgs',
+                   gpu_dict: dict,
+                   bs_list,
+                   seq_len: int,
+                   decode_len: int,
+                   gemm_group_per_device,
+                   device_num,
+                   pp: int,
+                   tp: int, dp: int,
+                   tps_limit: int = 0,
+                   fp8_combine: bool = False,
+                   print_console: bool = False):
+
+    # Base results without pipeline parallelism
+    df = decode_time(args, gpu_dict, bs_list, seq_len, decode_len,
+                     gemm_group_per_device, device_num,
+                     tps_limit=tps_limit,
+                     fp8_combine=fp8_combine,
+                     print_console=False)
+
+    if pp == 1:                       # PP disabled → nothing to add
+        if print_console:
+            print(df.set_index('GPU').T.to_markdown(floatfmt='.3f'))
+        return df
+
+    # ----------------------------------------------------------------
+    # Iterate over every (GPU , BatchSize) row and patch PP metrics
+    # ----------------------------------------------------------------
+    for idx, row in df.iterrows():
+        batch_sz  = int(row['BatchSize'])
+        serial_ms = float(row['TPOT'])              # per-token, serial
+
+        # ---- split the layer latency uniformly across `pp` stages ---
+        layers_per_stage = _uniform_split(args.n_layers, pp)
+        stage_times = [serial_ms * (l / args.n_layers)
+                       for l in layers_per_stage]
+
+        # ---- number of rounds that must traverse the pipeline -------
+        total_tokens = batch_sz * decode_len
+        rounds       = math.ceil(total_tokens / pp)  # ≥1
+
+        total_pp, bubble = _gpipe_latency(stage_times,
+                                          rounds=rounds,
+                                          is_decode=True)
+
+        # ---- write back results -------------------------------------
+        df.at[idx, 'Bubble']   = bubble
+        df.at[idx, 'TPOT_PP']  = total_pp
+        df.at[idx, 'Speedup']  = serial_ms / total_pp     # >1 ⇒ faster
+
+    if print_console:
+        print("\n[Decode · Pipeline-parallel]")
+        print(df.set_index('GPU').T.to_markdown(floatfmt='.3f'))
+
+    return df
 
 
 def df_filter(df,gpu,device_num=0, bs=0,tps_limit=0, value_list=[]):
