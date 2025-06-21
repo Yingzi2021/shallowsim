@@ -49,7 +49,6 @@
 
 > **Todo:** 
 >
-> - add support for model with slide window attention(SWA)
-> - add support for pipeline parallelism
+> - add support for model with slide window attention(SWA) (暂缓)
 > - MoE comp-comm overlap (all2all & matmul)
 
