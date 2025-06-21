@@ -10,8 +10,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Tuple, Optional, Literal
 from pathlib import Path
-from typing import Union
-from typing import List, Tuple
+from typing import Union,List, Tuple
 
 cm = sns.light_palette("red", as_cmap=True)
 NVL_GPU_LIST = [72, 144, 576]
@@ -830,7 +829,7 @@ def prefill_time_pp(args: 'ModelArgs',
 
         # ── pipeline latency for `micro_bs` chunks ─────────────────
         total_pp, bubble = _gpipe_latency(stage_times,
-                                          micro_bs=micro_bs,
+                                          rounds=micro_bs,
                                           is_decode=False)
 
         # 3) write Bubble / Total_PP rows
