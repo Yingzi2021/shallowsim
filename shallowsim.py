@@ -221,7 +221,7 @@ def _gpipe_latency(stage_times: List[float],
     """
     stage_times : latency of each pipeline stage  (ms)
     rounds      : number of micro-batches that will flow through
-                  · prefill →  rounds = micro_bs
+                  · prefill →  rounds = micro_chunks
                   · decode  →  rounds = ceil(batch_size * tgt_len / pp)
     is_decode   : True ⇒ one bubble *per round* (strict causal dep.)
     ----------------------------------------------------------------
@@ -238,8 +238,8 @@ def _gpipe_latency(stage_times: List[float],
         total  = sum(stage_times) * rounds + bubble_repeat + fill_drain
         bubble = fill_drain + bubble_repeat
     else:
-        steady_overlap = (rounds - 1) * t_max
-        total  = sum(stage_times) + fill_drain + steady_overlap
+        steady_overlap = (rounds - pp - 1) * t_max
+        total  = fill_drain + steady_overlap
         bubble = fill_drain                       
 
     return total, bubble
@@ -717,23 +717,15 @@ def prefill_time(args: ModelArgs,
     detail_df : layer-wise timing table (rows = metrics / cols = GPU)
     summary_df: summed compute / comm / total time (rows = metrics / cols = GPU)
     """
-    if args.attention == "mla":              # MoE MLA (DeepSeek-V3 style)
-            att_col       = "MLA"                # dense-layer MLA timing
-            tp_att_col    = "TP_MLA"             # TP-parallel sparse MLA
-    elif args.attention == "gqa":            # Dense GQA (Llama-3 style)
-        att_col       = "GQA"                # dense-layer GQA timing
-        tp_att_col    = "TP_GQA"
-    else:
-        raise ValueError(f"Unknown attention type: {args.attention}")
-
+    att_col = args.attention.upper()  # MLA or GQA
 
     # ---------- 1.  column layout depends on model type ----------
     if args.is_moe:                                          # MoE-MLA branch
-        col_order = ['GPU', att_col, 'DenseMLP', tp_att_col,
+        col_order = ['GPU', att_col, 'DenseMLP', 'TP-'+att_col,
                      'Shared Expert', 'Combine', 'Overlap1',
                      'Routed Expert', 'Dispatch', 'Overlap2']
     else:                                                    # Dense-GQA branch
-        col_order = ['GPU', att_col, 'DenseMLP', tp_att_col] # change name 'MLA' according to args.attention
+        col_order = ['GPU', att_col, 'DenseMLP', 'TP-'+att_col] 
 
     detail_df  = pd.DataFrame(columns=col_order)
     summary_df = pd.DataFrame(columns=['GPU', 'Compute', 'Comm', 'Sum'])
@@ -812,7 +804,7 @@ def prefill_time_pp(args: 'ModelArgs',
     """
     detail, summary = prefill_time(args, gpu_dict, seq_len,
                                    kv_cache_rate, tp, dp,
-                                   print_console=False)
+                                   print_console=False) # this function assumes batch size = 1
 
     if pp == 1:                       # fast path – nothing to do
         if print_console:
@@ -827,12 +819,12 @@ def prefill_time_pp(args: 'ModelArgs',
 
         # 2) derive per-stage timing  (uniform split)
         micro_chunk = bs // micro_bs             # ≥1
-        stage_times = [serial_one * micro_chunk * (l / args.n_layers)
+        stage_times = [serial_one * (l / args.n_layers)
                        for l in L_per_stage]
 
         # ── pipeline latency for `micro_bs` chunks ─────────────────
         total_pp, bubble = _gpipe_latency(stage_times,
-                                          rounds=micro_bs,
+                                          rounds=micro_chunk,
                                           is_decode=False)
 
         # 3) write Bubble / Total_PP rows
