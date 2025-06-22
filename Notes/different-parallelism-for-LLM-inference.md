@@ -139,15 +139,57 @@ The main limitation of this method is that, due to the sequential nature of the 
 
 ![](figs/four-way-pipeline-parallelism.png)
 
-| 概念/变量               | 论文/博客里常见名字 | 在示意图 (b) 里的对应 | 在 ShallowSim 新字段                  |
-| ----------------------- | ------------------- | --------------------- | ------------------------------------- |
-| **pipeline depth**      | # stage，way        | “4-way” 里的 4        | `pp_degree`                           |
-| **micro-batch**         | chunk, micro-batch  | F_{0,0}、F_{0,1} …    | `pp_chunks` 或函数参数 `micro_bs`     |
-| **fill / drain bubble** | pipeline bubble     | 图中白色梯形空档      | `_schedule_pipeline()` 里 `bubble_ms` |
-| **stage 计算时长**      | stage latency       | 彩块高度              | `stage_ts[i]`                         |
-| **steady-state步长**    | max (stage_ts)      | 一格框宽              | `max_t`                               |
+![](figs/34.png)
 
-Pipeline parallelism is not typically efficient in decode phase. See the introduction of paper *SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills* for some details.
+Pipeline Parallel是指将模型按layer切分成多个不同的*stage*，并将不同的stage放在不同的GPU卡(*device*)上。当一张卡完成自己stage的计算之后，将计算结果发送到下一张卡，进行下一个stage的计算。
+
+> 对比：
+>
+> - TP:层内并行
+> - PP:层间并行
+
+### Naive pipeline parallelism
+
+![](figs/35.png)
+
+> 无pipeline parallelism，有TP（假设device num >= TP）:
+>
+> ![](figs/32.png)
+
+但上述的native Pipeline Parallel方式会导致GPU空闲问题：当GPU1在计算F1的时候，其他的GPU只能空闲等待。改进方式是如下图所示的default Pipeline Parallel：除了进行模型切分之外，还进行数据的切分。将一个Batch的数据切分成多个microbatch，不同的device可以同时进行不同microbatch的不同stage计算，从而让各个device的计算overlap起来，提高流水线效率。
+
+> 同一pipeline stage(可能包含数个Layers)不同的batch之间不存在数据依赖关系，所以可以并行计算。但Layer 8~15（后面的层）的计算显然依赖于Layer 0~7（前面的层）的计算结果。
+
+### Default pipeline parallelism
+
+假设batch size = 8, micro batch size = 1.那么，每个pipeline stage被切成8份。
+
+![](figs/36.png)
+
+| 概念                            | 符号        | 作用                                                      |
+| ------------------------------- | ----------- | --------------------------------------------------------- |
+| **Global Batch Size (bs)**      | `B`         | /                                                         |
+| **Micro-Batch Size (micro_bs)** | `b`         | /                                                         |
+| **Pipeline Chunks**             | `K = B / b` | 也叫 *micro-batch count* 或 *gradient accumulation steps* |
+| **Pipeline Stages**             | `P`         | 把模型切成几段                                            |
+
+推理时设置K=2~4P比较合适。
+
+| K/P 比 | Speedup ≈ | 占理论极限 |
+| ------ | --------- | ---------- |
+| 1      | P/2       | 50 %       |
+| 2      | 0.67 × P  | 67 %       |
+| 4      | 0.80 × P  | 80 %       |
+| 8      | 0.89 × P  | 89 %       |
+| 16     | 0.94 × P  | 94 %       |
+
+ 如图P = 4, K = 8 = 2P
+
+### Pipeline Parallelism for Prefill or Decode 
+
+Pipeline parallelism is not typically efficient in decode phase. 
+
+> See the introduction of paper *SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills* for some details.
 
 为什么 **Pipeline Parallelism (PP)** 对 *推理-decode 阶段* 帮助有限？
 
@@ -163,55 +205,31 @@ Pipeline parallelism is not typically efficient in decode phase. See the introdu
 
 **2 · 直观示意**
 
-![](figs/32.png)
+![](figs/37.png)
 
 *Prefill*：方块开始重叠后，GPU 利用率接近 100 %。
-
-![](figs/33.png)
 
 *Decode*：一旦排空，“下一 token” 又从头开始填；4 张 GPU 中有 ¾ 时间在等结果 → 加速几乎被泡沫抵消。
 
 **理论分析**
 
-| 场景                       | 总时长公式                                                   |
-| -------------------------- | ------------------------------------------------------------ |
-| **串行执行**（没有 PP）    | T_serial = p · M · T                                         |
-| **Pipeline + micro-batch** | T_pipe=(M+2(p−1))⋅T                                          |
-| **速度提升**               | \text{Speed-up} = \frac{T_\text{serial}}{T_\text{pipe}} = \frac{p·M}{M + 2(p-1)} |
+| 场景                     | 总时长公式                          | Comment               |
+| ------------------------ | ----------------------------------- | --------------------- |
+| **串行执行**（没有 PP）  | T_serial = P · M · T                |                       |
+| **Pipeline Parallelism** | T_pipe= 2 * (P-1) * T + (M-P+1) * T | fill + drain + steady |
 
-- **p** = `pp_degree` ( 4-way pipeline ⇒ p = 4 )
-- **M** = micro-batch 数 (`pp_chunks`)，把全局 batch 切成 M 片
+- **P** = `stage_num` ( 4-way pipeline ⇒ P = 4 )
+- **M** = chunk 数 (`pp_chunks`, = bs / micro_bs)，把全局 batch 切成 M 片
 - **T** = *单个 stage* 处理 **一片** micro-batch 的时长（假设 p 个 stage 时长相近）
 
-> M-->∞，speed-up --> p 
+Speedup
+$$
+\text{Speed-up} = \frac{T_\text{serial}}{T_\text{pipe}} = \frac{P·M}{M + P - 1}
+$$
 
-**3 · 什么时候 PP 对推理有用？**
+> M-->∞，speed-up --> P 
 
-1. **高并发、多序列并行**
-    把不同用户的序列按 token 对齐交错送 pipeline（称 *pipeline-level interleaving* 或 *wave scheduling*）。
-2. **Speculative / look-ahead 解码**
-    一次推多 token；等验证阶段回滚。`N_token` 变大后泡沫占比下降。
-3. **大 `max_t`、深网络、小 TP**
-    硬件本身算一次 layer 很慢（如 CPU 或少 GPU），PP 能压缩绝对延迟。
+对于Prefill阶段和decode阶段这个公式实际上是一样的，只是T不同。prefill阶段每个chunk的计算时间显然比decode 1个token长；decode要算总时间的话需要乘以T_pipe * seq_len.
 
-**4 · 如何在 ShallowSim 里表达这种现象？**
-
-1. **prefill_time_pp()**
-   - 泡沫只加一次：`bubble = 2·(pp-1)·max_t`.
-2. **decode_time_pp()**
-   - 每 token 付一次 bubble：
-      `total = (decode_len + pp - 1) · max_t`
-   - 在输出 DF 里保留 `Bubble`、`Total_PP` 两列，
-      方便可视化 “泡沫占比”。
-
-这样跑出来会看到：
-
-- Prefill Total_PP 显著小于原 Total；
-- Decode Total_PP 略小或几乎相同——验证了 “PP 在 decode 阶段收益不大”。
-
-**5 · 结论**
-
-- **推理前半（prefill）**：PP + micro-batch 能大幅压缩延迟；
-- **逐 token decode**：若不做跨请求 interleaving 或 speculative trick，
-   **加 Pipeline 的收益极其有限**——这也是为什么主流框架（FasterTransformer, vLLM）推理时更关注 **TensorParallel + KV-Cache 优化** 而不是 PP。
+> vanilla的T_serial要算TP吗？
 
