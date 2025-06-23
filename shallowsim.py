@@ -106,12 +106,12 @@ class ModelArgs:
 
 
 class Config:
-    seq_len = 4383
-    decode_len = 1210
+    seq_len = 4383 # prompt length
+    decode_len = 1210 # tokens to generate(only used to calculate decoding batchsize???)(TODO)
     kv_cache_rate = 0.563
-    # decode_len = 1210
     bs_list = [16, 32, 64, 128, 256, 512]
     eplist = [8, 16, 36, 72, 144, 320]
+    # move pp & micro_bs & tp_list to here?(TODO)
 
 
 class GPU_perf:
@@ -215,15 +215,11 @@ def _uniform_split(total_layers: int, pp: int) -> List[int]:
 # ---------------------------------------------------------------------------
 # 2. Utility – GPipe latency model
 # ---------------------------------------------------------------------------
-def _gpipe_latency(stage_times: List[float],
-                   rounds: int,
-                   is_decode: bool) -> Tuple[float, float]:
+def _gpipe_latency(stage_times: List[float], rounds: int,) -> Tuple[float, float]:
     """
-    stage_times : latency of each pipeline stage  (ms)
-    rounds      : number of micro-batches that will flow through
-                  · prefill →  rounds = micro_chunks
-                  · decode  →  rounds = ceil(batch_size * tgt_len / pp)
-    is_decode   : True ⇒ one bubble *per round* (strict causal dep.)
+    need args.decode_len/seq_len
+    stage_times : latency of each pipeline stage  (ms),assume batch size = 1
+    rounds      : number of chunks in 1 stage
     ----------------------------------------------------------------
     Returns (total_time_ms , bubble_time_ms)
     """
@@ -232,17 +228,11 @@ def _gpipe_latency(stage_times: List[float],
 
     fill_drain = 2 * (pp - 1) * t_max          # ms
 
-    if is_decode:
-        steady_overlap = (rounds - 1) * (t_max * pp)   
-        bubble_repeat  = (rounds - 1) * fill_drain
-        total  = sum(stage_times) * rounds + bubble_repeat + fill_drain
-        bubble = fill_drain + bubble_repeat
-    else:
-        steady_overlap = (rounds - pp - 1) * t_max
-        total  = fill_drain + steady_overlap
-        bubble = fill_drain                       
+    steady_overlap = (rounds - pp - 1) * t_max
+    total  = fill_drain + steady_overlap
+    bubble = fill_drain                       
 
-    return total, bubble
+    return total, bubble # for decode the result is per-token
 
 
 # 非吸收的版本
@@ -788,9 +778,10 @@ def prefill_time(args: ModelArgs,
 # ---------------------------------------------------------------------------
 # 3. Public – Prefill with PP
 # ---------------------------------------------------------------------------
-def prefill_time_pp(args: 'ModelArgs',
+# todo: support bs_list somewhere? coherent with decode_time
+def prefill_time_pp(args: ModelArgs,
+                    config: Config,
                     gpu_dict: dict,
-                    seq_len: int,
                     kv_cache_rate: float,
                     tp: int, dp: int,
                     bs:int,
@@ -802,7 +793,7 @@ def prefill_time_pp(args: 'ModelArgs',
     • `pp`        : pipeline degree (≥1)
     • `micro_bs`  : micro-batches that form one *global* batch
     """
-    detail, summary = prefill_time(args, gpu_dict, seq_len,
+    detail, summary = prefill_time(args, gpu_dict, config.seq_len,
                                    kv_cache_rate, tp, dp,
                                    print_console=False) # this function assumes batch size = 1
 
@@ -815,7 +806,7 @@ def prefill_time_pp(args: 'ModelArgs',
 
     for gpu_name in summary.columns:
         # 1) serial latency of one prompt
-        serial_one = float(summary.at['Sum', gpu_name])
+        serial_one = float(summary.at['Sum', gpu_name]) # serial time (with bs=1)
 
         # 2) derive per-stage timing  (uniform split)
         micro_chunk = bs // micro_bs             # ≥1
@@ -823,9 +814,7 @@ def prefill_time_pp(args: 'ModelArgs',
                        for l in L_per_stage]
 
         # ── pipeline latency for `micro_bs` chunks ─────────────────
-        total_pp, bubble = _gpipe_latency(stage_times,
-                                          rounds=micro_chunk,
-                                          is_decode=False)
+        total_pp, bubble = _gpipe_latency(stage_times, micro_chunk)
 
         # 3) write Bubble / Total_PP rows
         for row, val in (('Bubble',    bubble),
@@ -997,7 +986,7 @@ def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, ex
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
     for key in gpu_dict.keys():
         for bs in bs_list:
-            t = _prefill_dense_mlp(args, gpu_dict[key], bs)
+            t = _prefill_dense_mlp(args, gpu_dict[key], bs) # for decode, seq_len = 1(per token generation) * bs
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
@@ -1198,7 +1187,7 @@ def _decode_time(args: ModelArgs,
     # Common helpers
     # ------------------------------------------------------------
     base_keys       = ['GPU', 'BatchSize', 'TP']   # merge keys
-    att_label       = "MLA" if args.attention == "mla" else "GQA"
+    att_label       = args.attention.upper()  # MLA or GQA
     tp_list         = [1, 4, 8]                    # default TP sweep
 
     # ============================================================
@@ -1207,29 +1196,20 @@ def _decode_time(args: ModelArgs,
     if not args.is_moe:
         # 1-A  Attention  (includes Load-KV latency)
         if args.attention == "gqa":
-            att_df = decode_gqa(args, gpu,
-                                bs_list, seq_len, decode_len)
-            # rename for uniform downstream column usage
-            # att_df = att_df.rename(columns={"DenseGQA": "SparseMLA"})
-        else:          # dense MLA kernel (rare but supported)
-            att_df = decode_mla(args, gpu,
-                                bs_list, seq_len, decode_len,
-                                expert_num=0)         # no experts
-            #att_df = att_df.rename(columns={"DenseMLA": "SparseMLA"})
-
+            att_df = decode_gqa(args, gpu, bs_list, seq_len, decode_len)
+        else:         
+            att_df = decode_mla(args, gpu, bs_list, seq_len, decode_len, expert_num=0)        
+            
         # 1-B  Dense-MLP
-        dmlp_df = decode_dense_mlp(args, gpu,
-                                   bs_list, seq_len, decode_len,expert_num=0)
+        dmlp_df = decode_dense_mlp(args, gpu, bs_list, seq_len, decode_len,expert_num=0)
 
         # 1-C  merge and zero-fill missing MoE/A2A columns
         df = pd.merge(att_df[base_keys + ['LoadKV', 'Dense'+att_label]],
                       dmlp_df[base_keys + ['DenseMLP']],
                       on=base_keys, how='left')
 
-        # Dense-side: DenseMLA  = SparseMLA,   SparseMLA reset to 0
-        # df['Dense'+att_label]  = df['Sparse'+att_label]
+        # Dense-side:Sparse parts reset to 0
         df['Sparse'+att_label] = 0.0
-
         for col in ['SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine']:
             df[col] = 0.0
 
@@ -1365,20 +1345,18 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
     dd['BatchSize'] = dd['BatchSize'].astype(int)
     return dd
 
-def decode_time_pp(args: 'ModelArgs',
+def decode_time_pp(args: ModelArgs,
+                   config: Config,
                    gpu_dict: dict,
-                   bs_list,
-                   seq_len: int,
-                   decode_len: int,
                    gemm_group_per_device,
                    device_num,
-                   pp: int,
+                   pp: int, micro_bs: int,
                    tps_limit: int = 0,
                    fp8_combine: bool = False,
                    print_console: bool = False):
 
     # Base results without pipeline parallelism
-    df = decode_time(args, gpu_dict, bs_list, seq_len, decode_len,
+    df = decode_time(args, gpu_dict, config.bs_list, config.seq_len, config.decode_len,
                      gemm_group_per_device, device_num,
                      tps_limit=tps_limit,
                      fp8_combine=fp8_combine,
@@ -1392,28 +1370,25 @@ def decode_time_pp(args: 'ModelArgs',
     # ----------------------------------------------------------------
     # Iterate over every (GPU , BatchSize) row and patch PP metrics
     # ----------------------------------------------------------------
-    for idx, row in df.iterrows():
-        batch_sz  = int(row['BatchSize'])
-        serial_ms = float(row['TPOT'])              # per-token, serial
+    layers_per_stage = _uniform_split(args.n_layers, pp)
 
-        # ---- split the layer latency uniformly across `pp` stages ---
-        layers_per_stage = _uniform_split(args.n_layers, pp)
-        stage_times = [serial_ms * (l / args.n_layers)
+    for idx, row in df.iterrows():
+        bs  = int(row['BatchSize'])
+        
+        serial_one = float(row['TPOT']) / bs # per-token, serial,with batch size = 1
+        micro_chunk = bs // micro_bs # per-token
+
+        stage_times = [serial_one * (l / args.n_layers)
                        for l in layers_per_stage]
 
-        # ---- number of rounds that must traverse the pipeline -------
-        total_tokens = batch_sz * decode_len
-        rounds       = math.ceil(total_tokens / pp)  # ≥1
-
-        total_pp, bubble = _gpipe_latency(stage_times,
-                                          rounds=rounds,
-                                          is_decode=True)
+        pp_per_token, bubble_per_token = _gpipe_latency(stage_times,micro_chunk)
+        total_pp = pp_per_token * config.decode_len
 
         # ---- write back results -------------------------------------
         df.at[idx, 'PP']       = pp
-        df.at[idx, 'Bubble']   = bubble
+        df.at[idx, 'Bubble']   = bubble_per_token * config.decode_len
         df.at[idx, 'TPOT_PP']  = total_pp
-        df.at[idx, 'Speedup']  = (serial_ms * total_tokens) / total_pp     # >1 ⇒ faster (bug!!!)
+        df.at[idx, 'Speedup']  = (serial_one * bs * config.decode_len) / total_pp 
 
     if print_console:
         print("\n[Decode · Pipeline-parallel]")
