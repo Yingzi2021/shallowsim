@@ -231,5 +231,7 @@ $$
 
 对于Prefill阶段和decode阶段这个公式实际上是一样的，只是T不同。prefill阶段每个chunk的计算时间显然比decode 1个token长；decode要算总时间的话需要乘以T_pipe * seq_len.
 
-> vanilla的T_serial要算TP吗？
+> shallowsim的original实现中，`_prefill_time`和`_decode_time`都已经考虑了TP（见attention计算）
+>
+> （Encapsulation！）
 
