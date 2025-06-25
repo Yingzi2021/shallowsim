@@ -199,9 +199,6 @@ def gpu_category_idx(gpu_dict):
     return gpu_category
 
 
-# ---------------------------------------------------------------------------
-# 1. Utility – split L layers into `pp` stages (uniform-cost assumption)
-# ---------------------------------------------------------------------------
 def _uniform_split(total_layers: int, pp: int) -> List[int]:
     """
     Return a list of *layer counts* per pipeline stage.
@@ -212,9 +209,7 @@ def _uniform_split(total_layers: int, pp: int) -> List[int]:
     base, rem = divmod(total_layers, pp)
     return [base + 1 if i < rem else base for i in range(pp)]
 
-# ---------------------------------------------------------------------------
-# 2. Utility – GPipe latency model
-# ---------------------------------------------------------------------------
+
 def _gpipe_latency(stage_times: List[float], rounds: int,) -> Tuple[float, float]:
     """
     need args.decode_len/seq_len
@@ -226,7 +221,7 @@ def _gpipe_latency(stage_times: List[float], rounds: int,) -> Tuple[float, float
     pp = len(stage_times)
     t_max = max(stage_times)
 
-    fill_drain = 2 * (pp - 1) * t_max          # ms
+    fill_drain = 2 * (pp - 1) * t_max 
 
     steady_overlap = (rounds - pp - 1) * t_max
     total  = fill_drain + steady_overlap
@@ -236,8 +231,6 @@ def _gpipe_latency(stage_times: List[float], rounds: int,) -> Tuple[float, float
 
 
 # 非吸收的版本
-
-
 def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     # calculate MACs and estimate Flops approx. 2xMAC.
     q_down_proj = q_len * args.dim * args.q_lora_rank  # wq_a
@@ -264,9 +257,8 @@ def mla_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
 
     return GEMM_FP8_FLOPS+ATTN_FP16_FLOPS, GEMM_FP8_FLOPS, ATTN_FP16_FLOPS
 
+
 # 矩阵吸收的版本
-
-
 def mla_matabsob_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate=0):
     # calculate MACs and estimate Flops approx. 2xMAC.
     q_down_proj = q_len * args.dim * args.q_lora_rank  # wq_a
@@ -307,12 +299,12 @@ def mla_mem(args: ModelArgs):
     wo = args.n_heads * args.v_head_dim * args.dim  # wo
     return (q_down_proj + q_up_proj + k_up_proj + kv_down_proj + v_up_proj + wo)/1024/1024
 
-
+# has TP/DP 
 def mla_elapse_time(args: ModelArgs,
                     gpu: GPU_perf,
                     seq_len,
                     kv_cache_rate,
-                    tp=[2, 4, 8, 16, 32],
+                    tp=[1, 4, 8],
                     decoding_mode=True,
                     batchsize=1,
                     enable_gemm_fp4=True,
@@ -390,12 +382,7 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
     return df
 
 
-# add pp
-# add qwen / mistral support
-def gqa_flops(q_len: int,
-                    kv_len: int,
-                    args: ModelArgs,
-                    kv_cache_rate: float):
+def gqa_flops(q_len, kv_len, args: ModelArgs, kv_cache_rate):
     """
     FLOPs for one dense-GQA layer.
 
@@ -462,18 +449,18 @@ def gqa_mem(args: ModelArgs):
     return total_params / 1024 / 1024         # → MiB
 
 
-
+# has TP/DP 
 def gqa_elapse_time(args: ModelArgs,
                           gpu: GPU_perf,
-                          seq_len: int,
-                          kv_cache_rate: float,
-                          tp=(1, 4, 8),
-                          decoding_mode: bool = True,
-                          batchsize: int = 1,
-                          enable_gemm_fp4: bool = True,
-                          dense_discount: float = 0.8,
-                          static_kernel_time: float = 0.05,
-                          min_ar_time: float = 0.015,
+                          seq_len,
+                          kv_cache_rate,
+                          tp=[1, 4, 8],
+                          decoding_mode: bool=True,
+                          batchsize=1,
+                          enable_gemm_fp4=True,
+                          min_ar_time=0.015,
+                          gqa_discount=0.8, # need profile(TODO)
+                          gqa_kernel_static_time=0.05,
                           print_console: bool = False):
     """
     Timing model for Dense-GQA Attention (no MoE).
@@ -496,8 +483,8 @@ def gqa_elapse_time(args: ModelArgs,
         gemm_t = gemm_flops / gpu.get_fp4_flops()
     else:
         gemm_t = gemm_flops / gpu.get_fp8_flops()
-    gemm_t /= dense_discount
-    att_t   = attn_fp16_flops / gpu.get_fp16_flops() / dense_discount
+    gemm_t /= gqa_discount
+    att_t   = attn_fp16_flops / gpu.get_fp16_flops() / gqa_discount
 
     # load weight
     load_t  = gqa_mem(args) / gpu.get_mem_bw()
@@ -512,7 +499,7 @@ def gqa_elapse_time(args: ModelArgs,
     for tp_degree in tp:
         tp_time[tp_degree] = (total / tp_degree +
                               (0 if tp_degree == 1 else ar_t) +
-                              static_kernel_time)
+                              gqa_kernel_static_time)
 
     if print_console:
         print(f"[{gpu.gpu_type}] Dense-GQA total(ms): {total:.3f}")
@@ -522,11 +509,7 @@ def gqa_elapse_time(args: ModelArgs,
     return total, tp_time
 
 
-def prefill_gqa(args: ModelArgs,
-                gpu_dict: dict,
-                seq_len: int,
-                kv_cache_rate: float,
-                print_console: bool = False):
+def prefill_gqa(args: ModelArgs, gpu_dict: dict, seq_len, kv_cache_rate, print_console=False):
     """
     Prefill attention latency for Dense-GQA models.
     """
@@ -553,6 +536,7 @@ def densmlp_mem(args: ModelArgs):
     return 3 * args.dim * args.inter_dim / 1024/1024
 
 
+# no TP
 def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
     if gpu.get_fp4_flops() != 0:
@@ -584,7 +568,7 @@ def moe_expert_flops(args: ModelArgs, seq_len):
 def moe_expert_mem(args: ModelArgs):
     return 3 * args.dim * args.moe_inter_dim / 1024 / 1024
 
-
+# has TP/DP
 def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
     load_time = moe_expert_mem(args) / gpu.get_mem_bw()
     gemm_flops = gpu.get_fp4_flops() if gpu.get_fp4_flops() != 0 else gpu.get_fp8_flops()
@@ -603,7 +587,7 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
 
     return shared_time, routed_time
 
-
+# has TP/DP 
 def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
                 tp_list=[4, 8],
                 dp_list=[4, 8, 9],
@@ -621,7 +605,7 @@ def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
 
-
+# has TP/DP
 def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
     if gpu.gpu_per_node == 8:
         dp = gpu.gpu_per_node/tp
@@ -645,7 +629,7 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
     combine_time = combine_size / comm_bw + static_latency
     return dispatch_time, combine_time
 
-
+# has TP
 def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'Dispatch', 'Combine'])
     for tp in [4, 8]:
@@ -689,11 +673,6 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
     return dense_att, dense_mlp, tp_att[tp], shared, combine, routed, dispatch
 
 
-# ------------------------------------------------------------------
-#  Prefill-stage layer-wise timing table
-#  • MoE-MLA  → original wide table (with Shared / Routed / A2A columns)
-#  • Dense-GQA→ compact table (only MLA-type and DenseMLP columns)
-# ------------------------------------------------------------------
 def prefill_time(args: ModelArgs,
                  gpu_dict: dict,
                  seq_len: int,
@@ -840,9 +819,6 @@ def prefill_time_pp(args: ModelArgs,
 
 # Decoding
 
-# ------------------------------------------------------------------
-#  Max batch size that fits one GPU during *decoding* (KV-cache live)
-# ------------------------------------------------------------------
 def _decoding_batchsize(args: ModelArgs,
                         gpu: GPU_perf,
                         seq_len: int,
@@ -918,7 +894,7 @@ def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
     print(df.set_index('GPU').to_markdown(floatfmt=".0f"))
     return df
 
-
+# has TP
 def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
@@ -948,8 +924,8 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
 
-
-def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console=False):
+# has TP
+def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_console=False):
     """
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
@@ -980,7 +956,7 @@ def decode_gqa(args: ModelArgs,gpu_dict,bs_list,seq_len,decode_len,print_console
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
 
-
+# has TP
 def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
     tp_list = [1, 4, 8]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
@@ -1080,7 +1056,7 @@ def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs,
     routed_time = routed_flops / gpu_flops + load_time * gemm_group_per_device
     return shared_time, routed_time
 
-
+# has TP
 def decode_moe_expert(args: ModelArgs, gpu_dict, 
                       bs_list, seq_len, decode_len, 
                       gemm_group_per_device,
@@ -1135,7 +1111,7 @@ def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_com
     combine_t = combine_size / comm_bw + static_latency * mbs
     return dispatch_t, combine_t
 
-
+# has TP
 def decode_a2a(args: ModelArgs, gpu_dict,
                bs_list, seq_len, decode_len,
                expert_num, device_num,
@@ -1167,11 +1143,6 @@ def decode_a2a(args: ModelArgs, gpu_dict,
     return df
 
 
-# ------------------------------------------------------------------
-#  Per–layer decode-time table for one GPU
-#  • Branch = MoE   →   use MLA + Expert + A2A paths
-#  • Branch = Dense →   use Dense-attention path only
-# ------------------------------------------------------------------
 def _decode_time(args: ModelArgs,
                  gpu: GPU_perf,
                  bs_list,
