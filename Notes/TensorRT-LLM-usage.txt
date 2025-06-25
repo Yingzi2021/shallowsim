@@ -1,0 +1,124 @@
+[TensorRT-LLM] TensorRT-LLM version: 0.20.0
+
+usage: trtllm-build [-h] [--checkpoint_dir CHECKPOINT_DIR] [--model_config MODEL_CONFIG] [--build_config BUILD_CONFIG]
+
+                    [--model_cls_file MODEL_CLS_FILE] [--model_cls_name MODEL_CLS_NAME] [--output_dir OUTPUT_DIR]
+
+                    [--max_batch_size MAX_BATCH_SIZE] [--max_input_len MAX_INPUT_LEN] [--max_seq_len MAX_SEQ_LEN]
+
+                    [--max_beam_width MAX_BEAM_WIDTH] [--max_num_tokens MAX_NUM_TOKENS] [--opt_num_tokens OPT_NUM_TOKENS]
+
+                    [--max_encoder_input_len MAX_ENCODER_INPUT_LEN]
+
+                    [--max_prompt_embedding_table_size MAX_PROMPT_EMBEDDING_TABLE_SIZE] [--kv_cache_type KV_CACHE_TYPE]
+
+                    [--paged_kv_cache PAGED_KV_CACHE] [--input_timing_cache INPUT_TIMING_CACHE]
+
+                    [--output_timing_cache OUTPUT_TIMING_CACHE] [--profiling_verbosity {layer_names_only,detailed,none}]
+
+                    [--strip_plan] [--weight_sparsity] [--weight_streaming] [--fast_build] [--workers WORKERS]
+
+                    [--log_level {internal_error,error,warning,info,verbose,debug}] [--enable_debug_output]
+
+                    [--visualize_network VISUALIZE_NETWORK] [--dry_run] [--monitor_memory] [--logits_dtype {float16,float32}]
+
+                    [--gather_context_logits] [--gather_generation_logits] [--gather_all_token_logits]
+
+                    [--lora_dir LORA_DIR [LORA_DIR ...]] [--lora_ckpt_source {hf,nemo}]
+
+                    [--lora_target_modules {attn_qkv,attn_q,attn_k,attn_v,attn_dense,mlp_h_to_4h,mlp_4h_to_h,mlp_gate,cross_attn_qkv,cross_attn_q,cross_attn_k,cross_attn_v,cross_attn_dense,moe_h_to_4h,moe_4h_to_h,moe_gate,moe_router,mlp_router,mlp_gate_up} [{attn_qkv,attn_q,attn_k,attn_v,attn_dense,mlp_h_to_4h,mlp_4h_to_h,mlp_gate,cross_attn_qkv,cross_attn_q,cross_attn_k,cross_attn_v,cross_attn_dense,moe_h_to_4h,moe_4h_to_h,moe_gate,moe_router,mlp_router,mlp_gate_up} ...]]
+
+                    [--max_lora_rank MAX_LORA_RANK]
+
+                    [--speculative_decoding_mode {draft_tokens_external,lookahead_decoding,medusa,explicit_draft_tokens,eagle}]
+
+                    [--max_draft_len MAX_DRAFT_LEN] [--auto_parallel AUTO_PARALLEL] [--gpus_per_node GPUS_PER_NODE]
+
+                    [--cluster_key {A100-SXM-80GB,A100-SXM-40GB,A100-PCIe-80GB,A100-PCIe-40GB,H100-SXM,H100-PCIe,H20,H200-SXM,H200-NVL,A40,A30,A10,A10G,L40S,L40,L20,L4,L2}]
+
+                    [--bert_attention_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--gpt_attention_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--gemm_plugin {auto,float16,float32,bfloat16,int32,fp8,nvfp4,disable}]
+
+                    [--gemm_swiglu_plugin {fp8,disable}]
+
+                    [--fp8_rowwise_gemm_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--nccl_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--lora_plugin {auto,float16,float32,bfloat16,int32,disable}] [--dora_plugin {enable,disable}]
+
+                    [--moe_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--mamba_conv1d_plugin {auto,float16,float32,bfloat16,int32,disable}]
+
+                    [--low_latency_gemm_plugin {fp8,disable}] [--low_latency_gemm_swiglu_plugin {fp8,disable}]
+
+                    [--gemm_allreduce_plugin {float16,bfloat16,disable}] [--context_fmha {enable,disable}]
+
+                    [--bert_context_fmha_fp32_acc {enable,disable}] [--remove_input_padding {enable,disable}]
+
+                    [--norm_quant_fusion {enable,disable}] [--reduce_fusion {enable,disable}]
+
+                    [--user_buffer {enable,disable}] [--tokens_per_block TOKENS_PER_BLOCK]
+
+                    [--use_paged_context_fmha {enable,disable}] [--use_fp8_context_fmha {enable,disable}]
+
+                    [--fuse_fp4_quant {enable,disable}] [--multiple_profiles {enable,disable}]
+
+                    [--paged_state {enable,disable}] [--streamingllm {enable,disable}] [--use_fused_mlp {enable,disable}]
+
+                    [--pp_reduce_scatter {enable,disable}]
+
+
+
+[TensorRT-LLM] TensorRT-LLM version: 0.20.0
+Usage: trtllm-serve serve [OPTIONS] MODEL
+
+  Running an OpenAI API compatible server
+
+  MODEL: model name | HF checkpoint path | TensorRT engine path
+
+Options:
+  --tokenizer TEXT                Path | Name of the tokenizer.Specify this
+                                  value only if using TensorRT engine as
+                                  model.
+  --host TEXT                     Hostname of the server.
+  --port INTEGER                  Port of the server.
+  --backend [pytorch]             Set to 'pytorch' for pytorch path. Default
+                                  is cpp path.
+  --log_level [internal_error|error|warning|info|verbose|debug]
+                                  The logging level.
+  --max_beam_width INTEGER        Maximum number of beams for beam search
+                                  decoding.
+  --max_batch_size INTEGER        Maximum number of requests that the engine
+                                  can schedule.
+  --max_num_tokens INTEGER        Maximum number of batched input tokens after
+                                  padding is removed in each batch.
+  --max_seq_len INTEGER           Maximum total length of one request,
+                                  including prompt and outputs. If
+                                  unspecified, the value is deduced from the
+                                  model config.
+  --tp_size INTEGER               Tensor parallelism size.
+  --pp_size INTEGER               Pipeline parallelism size.
+  --ep_size INTEGER               expert parallelism size
+  --cluster_size INTEGER          expert cluster parallelism size
+  --gpus_per_node INTEGER         Number of GPUs per node. Default to None,
+                                  and it will be detected automatically.
+  --kv_cache_free_gpu_memory_fraction FLOAT
+                                  Free GPU memory fraction reserved for KV
+                                  Cache, after allocating model weights and
+                                  buffers.
+  --num_postprocess_workers INTEGER
+                                  [Experimental] Number of workers to
+                                  postprocess raw responses to comply with
+                                  OpenAI protocol.
+  --trust_remote_code             Flag for HF transformers.
+  --extra_llm_api_options TEXT    Path to a YAML file that overwrites the
+                                  parameters specified by trtllm-serve.
+  --reasoning_parser [deepseek-r1]
+                                  [Experimental] Specify the parser for
+                                  reasoning models.
+  --help                          Show this message and exit.
