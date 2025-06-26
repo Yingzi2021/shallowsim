@@ -307,7 +307,7 @@ def mla_elapse_time(args: ModelArgs,
                     tp=[1, 2, 4],
                     decoding_mode=True,
                     batchsize=1,
-                    enable_gemm_fp4=True,
+                    enable_gemm_fp4=False,
                     min_ar_time=0.015,  # Allreduce的静态延迟
                     mla_discount=0.7,  # based on FlashMLA result on H800
                     mla_kernel_static_time=0.05,
@@ -373,7 +373,7 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
                                        seq_len, kv_cache_rate,
                                        tp=[2, 4],
                                        decoding_mode=False,
-                                       enable_gemm_fp4=True,
+                                       enable_gemm_fp4=False,
                                        print_console=print_console)
         df.loc[len(df)] = [gpu_dict[key].gpu_type, tp1] + \
             list(tp_list.values())
@@ -457,7 +457,7 @@ def gqa_elapse_time(args: ModelArgs,
                           tp=[1, 2, 4],
                           decoding_mode: bool=True,
                           batchsize=1,
-                          enable_gemm_fp4=True,
+                          enable_gemm_fp4=False,
                           min_ar_time=0.015,
                           gqa_discount=0.7, # need profile(TODO)
                           gqa_kernel_static_time=0.05,
@@ -521,7 +521,7 @@ def prefill_gqa(args: ModelArgs, gpu_dict: dict, seq_len, kv_cache_rate, print_c
             kv_cache_rate=kv_cache_rate,
             tp=[1, 2, 4],
             decoding_mode=False,
-            enable_gemm_fp4=True)
+            enable_gemm_fp4=False)
         df.loc[len(df)] = [key, tp1] + list(tp_list.values())
     if print_console:
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
@@ -650,14 +650,14 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
             seq_len, kv_cache_rate,
             tp=[tp],
             decoding_mode=False,
-            enable_gemm_fp4=True)
+            enable_gemm_fp4=False)
     elif args.attention == "gqa":      # Dense-GQA
         dense_att, tp_att = gqa_elapse_time(
             args, gpu,
             seq_len, kv_cache_rate,
             tp=[tp],
             decoding_mode=False,
-            enable_gemm_fp4=True)
+            enable_gemm_fp4=False)
     else:
         raise ValueError(f"Unsupported attention type: {args.attention}")
 
@@ -910,7 +910,7 @@ def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_n
                                                     tp=tp_list,
                                                     batchsize=bs,
                                                     decoding_mode=True,
-                                                    enable_gemm_fp4=True) # here.
+                                                    enable_gemm_fp4=False) # here.
             for tp_num in tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
