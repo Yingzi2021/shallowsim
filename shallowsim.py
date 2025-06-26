@@ -304,7 +304,7 @@ def mla_elapse_time(args: ModelArgs,
                     gpu: GPU_perf,
                     seq_len,
                     kv_cache_rate,
-                    tp=[1, 4, 8],
+                    tp=[1, 2, 4],
                     decoding_mode=True,
                     batchsize=1,
                     enable_gemm_fp4=True,
@@ -371,7 +371,7 @@ def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console
     for key in gpu_dict.keys():
         tp1, tp_list = mla_elapse_time(args, gpu_dict[key],
                                        seq_len, kv_cache_rate,
-                                       tp=[4, 8], #改成[1,4,8]?目前使用tp1,实际上少了一个mla static time
+                                       tp=[2, 4],
                                        decoding_mode=False,
                                        enable_gemm_fp4=True,
                                        print_console=print_console)
@@ -454,7 +454,7 @@ def gqa_elapse_time(args: ModelArgs,
                           gpu: GPU_perf,
                           seq_len,
                           kv_cache_rate,
-                          tp=[1, 4, 8],
+                          tp=[1, 2, 4],
                           decoding_mode: bool=True,
                           batchsize=1,
                           enable_gemm_fp4=True,
@@ -519,7 +519,7 @@ def prefill_gqa(args: ModelArgs, gpu_dict: dict, seq_len, kv_cache_rate, print_c
             args, gpu,
             seq_len=seq_len,
             kv_cache_rate=kv_cache_rate,
-            tp=[1, 4, 8],
+            tp=[1, 2, 4],
             decoding_mode=False,
             enable_gemm_fp4=True)
         df.loc[len(df)] = [key, tp1] + list(tp_list.values())
@@ -589,7 +589,7 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
 
 # has TP/DP 
 def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
-                tp_list=[4, 8],
+                tp_list=[2, 4],
                 dp_list=[4, 8, 9],
                 print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'DP',
@@ -632,7 +632,7 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
 # has TP
 def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'Dispatch', 'Combine'])
-    for tp in [4, 8]:
+    for tp in [2, 4]:
         for key in gpu_dict.keys():
             dispatch_time, combine_time = _prefill_alltoall(
                 args, gpu_dict[key], seq_len, tp)
@@ -715,7 +715,7 @@ def prefill_time(args: ModelArgs,
     # ------------- PER-GPU CALCULATION ---------------------------
     for key, gpu in gpu_dict.items():
         attn, dmlp, tp_attn, shared, combine, routed, dispatch = _prefill_time(
-            args, gpu, seq_len, kv_cache_rate, tp, dp) # rename 'mla' to 'attn'?
+            args, gpu, seq_len, kv_cache_rate, tp, dp) 
 
         # ---- overlap only meaningful for MoE ----
         overlap1 = combine - (tp_attn + shared) if args.is_moe else 0.0
@@ -727,7 +727,7 @@ def prefill_time(args: ModelArgs,
         detail_df.loc[len(detail_df)] = row
 
         # ---- summary (per GPU) ---------------------------------
-        comp_time = args.n_dense_layers * (attn + dmlp)
+        comp_time = args.n_dense_layers * (tp_attn + dmlp)
         if args.is_moe:
             comp_time += n_sparse_layers * (tp_attn + shared + routed)
 
@@ -898,7 +898,7 @@ def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
 def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
-    tp_list = [1, 4, 8]
+    tp_list = [1, 2, 4]
     for key in gpu_dict.keys():
         for bs in bs_list:
             kv_cache = seq_len * (args.kv_lora_rank +
@@ -929,7 +929,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_co
     """
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
-    tp_list = [1, 4, 8]
+    tp_list = [1, 2, 4]
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA','SparseGQA'])
 
     for key, gpu in gpu_dict.items():
@@ -958,7 +958,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_co
 
 # has TP
 def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+    tp_list = [1, 2, 4]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
     for key in gpu_dict.keys():
         for bs in bs_list:
@@ -1063,7 +1063,7 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
                       device_num,
                       mbs=2, 
                       print_console=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+    tp_list = [1, 2, 4]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'SharedExpert', 'RoutedExpert'])
     for gpu_key in gpu_dict.keys():
@@ -1117,7 +1117,7 @@ def decode_a2a(args: ModelArgs, gpu_dict,
                expert_num, device_num,
                mbs=2,
                print_console=False, fp8_combine=False):
-    tp_list = [1, 4, 8]  # only used for calc max batchsize
+    tp_list = [1, 2, 4]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
                       'TP', 'Dispatch', 'Combine'])
     for key in gpu_dict.keys():
@@ -1159,7 +1159,7 @@ def _decode_time(args: ModelArgs,
     # ------------------------------------------------------------
     base_keys       = ['GPU', 'BatchSize', 'TP']   # merge keys
     att_label       = args.attention.upper()  # MLA or GQA
-    tp_list         = [1, 4, 8]                    # default TP sweep
+    tp_list         = [1, 2, 4]                    # default TP sweep
 
     # ============================================================
     # 1.  NON-MoE   (pure dense, e.g. Llama-3)
