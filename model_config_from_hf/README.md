@@ -2,12 +2,11 @@
 
 (1)Evaluation
 
-| Name                  | Architecture | Size  |
-| --------------------- | ------------ | ----- |
-| TinyLlama             | Dense        | 1.1B  |
-| Qwen2.5-1.5B-Instruct | Dense        | 1.5B  |
-| Qwen1.5-MoE-A2.7B     | MoE          | 14.3B |
-| DeepSeek-V2-Lite      | Dense + MoE  | 16B   |
+| Name              | Architecture | Size  |
+| ----------------- | ------------ | ----- |
+| TinyLlama         | Dense        | 1.1B  |
+| Qwen1.5-MoE-A2.7B | MoE          | 14.3B |
+| deepseek-v2-lite  | Dense + MoE  | 16B   |
 
 (2)Simulation
 
