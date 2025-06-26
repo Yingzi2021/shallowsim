@@ -328,7 +328,7 @@ def mla_elapse_time(args: ModelArgs,
     # load weight
     load_t = mla_mem(args) / gpu.get_mem_bw()
 
-    total = gemm_fp8_t + attn_fp16_t + load_t
+    total = gemm_fp8_t + attn_fp16_t + load_t + mla_kernel_static_time
 
     if enable_gemm_fp4:
         if gpu.get_fp4_flops() == 0:
@@ -345,9 +345,9 @@ def mla_elapse_time(args: ModelArgs,
     tp_time = {}
     for v in tp:
         if v == 1:
-            tp_time[v] = total + mla_kernel_static_time
+            tp_time[v] = total
         else:
-            tp_time[v] = total / v + all_reduce_t + mla_kernel_static_time
+            tp_time[v] = total / v + all_reduce_t
 
     if print_console:
         if enable_gemm_fp4 & (gpu.get_fp4_flops() != 0):
@@ -497,9 +497,10 @@ def gqa_elapse_time(args: ModelArgs,
 
     tp_time = {}
     for tp_degree in tp:
-        tp_time[tp_degree] = (total / tp_degree +
-                              (0 if tp_degree == 1 else ar_t) +
-                              gqa_kernel_static_time)
+        if tp_degree == 1:
+            tp_time[tp_degree] = total
+        else:
+            tp_time[tp_degree] = total / tp_degree + ar_t
 
     if print_console:
         print(f"[{gpu.gpu_type}] Dense-GQA total(ms): {total:.3f}")
@@ -537,7 +538,7 @@ def densmlp_mem(args: ModelArgs):
 
 
 # no TP
-def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, print_console=False):
+def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, tp, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
     if gpu.get_fp4_flops() != 0:
         gemm_time = gemm_flops / gpu.get_fp4_flops()
@@ -545,16 +546,19 @@ def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, print_console=Fa
         gemm_time = gemm_flops / gpu.get_fp8_flops()
 
     load_time = densmlp_mem(args) / gpu.get_mem_bw()
-    gemm_time = gemm_time + load_time
+    gemm_time = gemm_time/tp + load_time
+
+    # all-reduce time(TP)(TODO)
+
     if print_console:
         print("[%8s]Elapsed time(ms): %.3f" % (gpu.gpu_type, gemm_time))
     return gemm_time
 
 
-def prefill_dense_mlp(args: ModelArgs, gpu_dict, seq_len, print_console=False):
+def prefill_dense_mlp(args: ModelArgs, gpu_dict, seq_len, tp, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'DenseMLP'])
     for key in gpu_dict.keys():
-        t = _prefill_dense_mlp(args, gpu_dict[key], seq_len, print_console=print_console)
+        t = _prefill_dense_mlp(args, gpu_dict[key], seq_len, tp, print_console=print_console)
         df.loc[len(df)] = [gpu_dict[key].gpu_type, t]
     if print_console:
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
@@ -661,7 +665,7 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
     else:
         raise ValueError(f"Unsupported attention type: {args.attention}")
 
-    dense_mlp = _prefill_dense_mlp(args, gpu, seq_len)
+    dense_mlp = _prefill_dense_mlp(args, gpu, seq_len, tp)
 
     # MoE-only parts ; skip when not MoE
     if args.is_moe:
