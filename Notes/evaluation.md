@@ -151,7 +151,7 @@ mkdir -p ${WEIGHT_DIR}
 mkdir -p ${ENGINE_DIR}
 ```
 
-(3)将HF格式的权重转换为TensorRT-LLM格式
+(3)**将HF格式的权重转换为TensorRT-LLM格式**
 
 ```bash
 python /app/tensorrt_llm/examples/models/core/llama/convert_checkpoint.py \
@@ -162,6 +162,16 @@ python /app/tensorrt_llm/examples/models/core/llama/convert_checkpoint.py \
        --tp_size 2 
        # expert parallelism: --moe_ep_size(default = 1)
 ```
+
+> **How to Enable Expert Parallelism**
+>
+> The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting `--moe_tp_size` and `--moe_ep_size` when calling `convert_coneckpoint.py`. If only `--moe_tp_size` is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only `--moe_ep_size` is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.
+>
+> Ensure the product of `moe_tp_size` and `moe_ep_size` is equal to `tp_size`, since the total number of MoE parallelism across all GPUs must match the total number of parallelism in other parts of the model.
+>
+> The other parameters related to the MoE structure, such as `num_experts_per_tok` (TopK in previous context) and `num_local_experts,` can be found in the model’s configuration file, such as the one for [Mixtral 8x7B model](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json). )
+>
+> see: https://nvidia.github.io/TensorRT-LLM/latest/advanced/expert-parallelism.html
 
 输出：
 
@@ -176,22 +186,48 @@ python /app/tensorrt_llm/examples/models/core/llama/convert_checkpoint.py \
 ```bash
 trtllm-build --checkpoint_dir ${WEIGHT_DIR} \
 --output_dir ${ENGINE_DIR} \
---max_num_tokens 10000 \
 --max_input_len 1024 \
 --max_batch_size 256            
 ```
 
-常见参数说明：
+`trtllm-build`常见参数说明：
 
-- `--gpt_attention_plugin`：默认启用 GPT 注意力插件，使用高效的Kernel并支持 KV 缓存的 in-place 更新。它会减少内存消耗，并删除不需要的内存复制操作（与使用 concat 运算符更新 KV 缓存的实现相比）。
-- `--context_fmha`：默认启用融合多头注意力，将触发使用单个Kernel执行 MHA/MQA/GQA 块的Kernel。
-- `--gemm_plugin`： GEMM 插件利用 NVIDIA cuBLASLt 执行 GEMM 运算。在 FP16 和 BF16 上，建议启用它，以获得更好的性能和更小的 GPU 内存使用量。在 FP8 上，建议禁用。如果通过 --gemm_plugin fp8 启用。尽管可以正确推断具有较大批量大小的输入，但性能可能会随着批量大小的增加而下降。因此，目前该功能仅推荐用于在小批量场景下的降低延迟。
-- `--use_custom_all_reduce`：启用自定义 AllReduce 插件。在基于 NVLink 的节点上，建议启用，在基于 PCIE 的节点上，不建议启用。自定义 AllReduce 插件为 AllReduce 运算激活延迟优化算法，而不是原生的 NCCL 算子。然而，在基于 PCIE 的系统上可能看不到性能优势。当限制为单个设备，自定义AllReduce将被禁用。因为其Kernel依赖于对对等设备的P2P访问，当只有一个设备可见时这是不允许的。
-- `--reduce_fusion enable`：当自定义 AllReduce 已启用时，此功能旨在将 AllReduce 之后的 ResidualAdd 和 LayerNorm Kernel 融合到单个Kernel中，从而提高端到端性能。注意：目前仅 llama 模型支持此功能。
-- `--paged_kv_cache`：默认启用分页KV缓存。分页 KV 缓存有助于更有效地管理 KV 缓存的内存。它通常能使批量大小增加和效率提高。
-- `--workers`：并行构建的worker数。
-- `--use_paged_context_fmha`：启用分页上下文注意力。
-- `--multiple_profiles`：在内置引擎中启用多个 TensorRT 优化配置文件，这将有利于性能，尤其是在禁用 GEMM 插件时，因为更多优化配置文件有助于 TensorRT 有更多机会选择更好的 Kernel。然而，它会增加引擎的构建时间。
+- `--checkpoint_dir`
+
+  The directory path that contains TensorRT-LLM checkpoint.
+- `--output_dir`
+
+  The directory path to save the serialized engine files and engine config file.Default: `'engine_outputs'`
+
+- `--max_batch_size`
+
+  Maximum number of requests that the engine can schedule.Default: `2048`
+- `--max_input_len`
+
+  Maximum input length of one request.Default: `1024`
+
+- `--max_seq_len`, `--max_decoder_seq_len`
+
+  Maximum total length of one request, **including prompt and outputs**. If unspecified, the value is deduced from the model config.
+
+- `--use_fused_mlp`
+
+  Possible choices: enable, disable. Enable horizontal fusion in Gated-MLP that combines two Matmul operations into a single one followed by a separate SwiGLU kernel.**Default**: `'enable'`
+
+详见：https://nvidia.github.io/TensorRT-LLM/commands/trtllm-build.html
+
+> simulator config:
+>
+> ```
+> class Config:
+>     seq_len = 4383 # prompt length
+>     decode_len = 1210 # tokens to generate
+>     kv_cache_rate = 0.563
+>     bs_list = [16, 32, 64, 128, 256, 512]
+>     eplist = [8, 16, 36, 72, 144, 320]
+> ```
+>
+> **Need alignment**: seq_len --> 1024
 
 构建完成之后生成了引擎文件以及配置文件，其中，引擎文件除了模型配置以外，还有很多引擎相关的配置，如：
 
@@ -224,6 +260,34 @@ docker run -d --name trtllm_tmp \
 ```
 
 ![](figs/43.png)
+
+`trtllm-serve`常见参数说明：
+
+- `--max_batch_size` 
+
+  Maximum number of requests that the engine can schedule.
+
+- `--max_num_tokens`
+
+  Maximum number of batched input tokens after padding is removed in each batch.
+
+- `--max_seq_len`
+
+  Maximum total length of one request, **including prompt and outputs**. If unspecified, the value is deduced from the model config.
+
+- `--tp_size` 
+
+  Tensor parallelism size.
+
+- `--pp_size`
+
+  Pipeline parallelism size.
+
+- `--ep_size`
+
+  expert parallelism size
+
+详见：https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html#starting-a-server
 
 (2) 检查：
 
@@ -292,6 +356,26 @@ docker run -it --net=host --gpus=all  nvcr.io/nvidia/tritonserver:${RELEASE}-py3
 genai-perf --help
 ```
 
+常见参数说明：
+
+- `--synthetic-input-tokens-mean <int>`: The mean of number of tokens in the generated prompts when using synthetic data, >= 1.
+
+  > set to 1024 to align with the simulator
+
+- `--output-tokens-mean <int>`: The mean number of tokens in each output. Ensure the `--tokenizer` value is set correctly, >= 1.
+
+- `--streaming`: An option to enable the use of the streaming API. (default: `False`)
+- `–batch-size-text` : The text batch size of the requests GenAI-Perf should send. (default: `1`)
+- `--concurrency <int>`: The concurrency value to benchmark. (default: `None`)
+- `--artifact-dir`: The directory to store all the (output) artifacts generated by GenAI-Perf and Perf Analyzer. (default: `artifacts`)
+
+- `--generate-plots`: An option to enable the generation of plots. (default: False)
+- `--profile-export-file <path>`: The path where the perf_analyzer profile export will be generated. By default, the profile export will be to `profile_export.json`. The genai-perf files will be exported to `<profile_export_file>_genai_perf.json` and `<profile_export_file>_genai_perf.csv`. For example, if the profile export file is `profile_export.json`, the genai-perf file will be exported to `profile_export_genai_perf.csv`. (default: `profile_export.json`)
+
+> Note:
+>
+> For [Large Language Models](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/docs/tutorial.html), there is no batch size **(i.e. batch size is always `1`).** Each request includes the inputs for one individual inference. Other modes such as the [embeddings](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/docs/embeddings.html) and [rankings](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/perf_analyzer/genai-perf/docs/rankings.html) endpoints support client-side batching, where `--batch-size-text N` means that each request sent will include the inputs for `N` separate inferences, allowing them to be processed together.
+
 ### 测试
 
 **基于TGI的LLM推理性能**
@@ -321,7 +405,7 @@ genai-perf profile \
 > LLM inference服务已经按照前文所述部署好
 
 ```bash
-mkdir -p $PWD/benchmark           # 存CSV/JSON
+mkdir -p $PWD/benchmark    
 
 sudo docker run --rm --name genai --net=host \
   -v /home/boyingchen/benchmark:/workspace/usr_ws \
@@ -332,16 +416,63 @@ sudo docker run --rm --name genai --net=host \
       --endpoint-type chat \
       -u http://localhost:8000 \
       --concurrency 4 \
-      --synthetic-input-tokens-mean 256 \
-      --output-tokens-mean 256 \
-      --measurement-interval 60000 \
+      --synthetic-input-tokens-mean 1024 \
+      --synthetic-input-tokens-stddev 0 \
+      --output-tokens-mean 100 \
+      --output-tokens-stddev 0 \
+      --request-count 64 \
+      --warmup-request-count 10 \
       --streaming \
-      --artifact-dir /workspace/usr_ws/artifacts
+      --generate-plots \
+      --artifact-dir /workspace/usr_ws/artifacts-bs4
 ```
 
 结果：
 
 ![](figs/44.png)
+
+## Baseline & simulator result
+
+（1）说明：simulator的结果是比较可信的
+
+> LLMs on 2 RTX 3090 with TP = 2, PP = 1, no EP.
+>
+> input_len = 1024. prefill batch size = 1, decode batch size = 1
+>
+> Error = |(Sim − Base)|/ Base × 100 %
+
+Prefill Time analysis:
+
+| Model Name     | Architecture | TP   | Baseline (ms) | Simulator (ms) | Error |
+| -------------- | ------------ | ---- | ------------- | -------------- | ----- |
+| tinyLlama-1.1B | Dense        | 1    | 22.86         | 12.54          | 48.6% |
+| tinyLlama-1.1B |              | 2    |               |                |       |
+| tinyLlama-1.1B |              | 4    |               |                |       |
+
+> batch size = 1 fix
+>
+> 条形图，横坐标TP-degree，纵坐标时间 (per model)，PP/EP不开启，Dense
+>
+> 条形图，横坐标PP-degree，纵坐标时间 (per model)，EP不开启，TP fix = device num
+>
+> 条形图，横坐标EP-degree，纵坐标时间 (per model) (MoE)，PP不开启，TP fix = device num
+>
+> 表格：Error rate / **rank** (TP/PP/EP)
+
+Decode Time analysis: (tinyLlama-1.1B on 2 RTX 3090 with TP = 2, PP = 1, no EP.)
+
+| Batch Size | Baseline (ms) | Simulator (ms) | Error |
+| ---------- | ------------- | -------------- | ----- |
+| 1          | 4.35          | 2.144          | 50.7% |
+| 4          | 4.53          | 2.193          | 51.5% |
+| 8          | 4.99          | 2.258          | 54.7% |
+| 16         | 6.01          | 2.388          | 60.2% |
+
+> 折线图（两条线+error条状）：时间随batch size变大而变大；
+
+（2）说明：可以使用simulator来寻找合适的并行配置
+
+> 参照原shallowsim的图
 
 ## 对比与联系
 
