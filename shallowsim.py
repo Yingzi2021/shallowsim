@@ -107,7 +107,7 @@ class ModelArgs:
 
 class Config:
     seq_len = 1024 # prompt length
-    decode_len = 1210 # tokens to generate(only used to calculate decoding batchsize???)(TODO)
+    decode_len = 100 # tokens to generate(only used to calculate decoding batchsize???)(TODO)(align)
     kv_cache_rate = 0.563
     bs_list = [16, 32, 64, 128, 256, 512]
     eplist = [8, 16, 36, 72, 144, 320]
@@ -459,7 +459,7 @@ def gqa_elapse_time(args: ModelArgs,
                           batchsize=1,
                           enable_gemm_fp4=True,
                           min_ar_time=0.015,
-                          gqa_discount=0.8, # need profile(TODO)
+                          gqa_discount=0.7, # need profile(TODO)
                           gqa_kernel_static_time=0.05,
                           print_console: bool = False):
     """
@@ -488,7 +488,7 @@ def gqa_elapse_time(args: ModelArgs,
 
     # load weight
     load_t  = gqa_mem(args) / gpu.get_mem_bw()
-    total  = gemm_t + att_t + load_t     # TP=1
+    total  = gemm_t + att_t + load_t + gqa_kernel_static_time    # TP=1
 
     # All-Reduce latency (tensor-parallel)
     ar_len  = batchsize if decoding_mode else seq_len
@@ -1241,7 +1241,7 @@ def decode_time(args: ModelArgs, gpu_dict,
                       gemm_group_per_device=gemm_group_per_device,
                       device_num=device_num,
                       fp8_combine=fp8_combine)
-
+# left TP in dense?
     def overlap_adjust(r):
         if r['Delta'] > 0:
             return r['TPOT_O'] + r['Delta'] * (args.n_layers - args.n_dense_layers)
@@ -1353,13 +1353,13 @@ def decode_time_pp(args: ModelArgs,
                        for l in layers_per_stage]
 
         pp_per_token, bubble_per_token = _gpipe_latency(stage_times,micro_chunk)
-        total_pp = pp_per_token * config.decode_len
+        total_pp = pp_per_token 
 
         # ---- write back results -------------------------------------
         df.at[idx, 'PP']       = pp
-        df.at[idx, 'Bubble']   = bubble_per_token * config.decode_len
+        df.at[idx, 'Bubble']   = bubble_per_token
         df.at[idx, 'TPOT_PP']  = total_pp
-        df.at[idx, 'Speedup']  = (serial_one * bs * config.decode_len) / total_pp 
+        df.at[idx, 'Speedup']  = (serial_one * bs) / total_pp 
 
     if print_console:
         print("\n[Decode · Pipeline-parallel]")
