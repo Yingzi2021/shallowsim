@@ -106,7 +106,7 @@ class ModelArgs:
 
 
 class Config:
-    seq_len = 4383 # prompt length
+    seq_len = 1024 # prompt length
     decode_len = 1210 # tokens to generate(only used to calculate decoding batchsize???)(TODO)
     kv_cache_rate = 0.563
     bs_list = [16, 32, 64, 128, 256, 512]
