@@ -545,6 +545,59 @@ def densmlp_flops(args: ModelArgs, seq_len):
 def densmlp_mem(args: ModelArgs):
     return 3 * args.dim * args.inter_dim / 1024/1024
 
+def densmlp_elapse_time(args: ModelArgs,
+                         gpu: GPU_perf,
+                         config: Config,
+                         seq_len,
+                         decoding_mode: bool = False,
+                         batchsize: int = 1,
+                         min_ar_time=0.015,
+                         print_console=False):
+    """
+    Calculates the elapsed time for a Dense MLP layer, accounting for Tensor Parallelism (TP).
+
+    Returns
+    -------
+    base_time_tp1_ms (float), {tp: elapsed_ms} (dict)
+    """
+    # 1. Calculate base time on a single GPU
+    # In decoding, the "sequence" processed per-token is the batch size
+    effective_seq_len = batchsize if decoding_mode else seq_len
+    
+    gemm_flops = densmlp_flops(args, effective_seq_len)
+
+    if gpu.get_fp4_flops() != 0:
+        compute_time = gemm_flops / gpu.get_fp4_flops()
+    else:
+        compute_time = gemm_flops / gpu.get_fp8_flops()
+    
+    load_time = densmlp_mem(args) / gpu.get_mem_bw()
+    
+    # Total time for a single GPU before parallelism
+    total_single_gpu_time = compute_time + load_time
+
+    # 2. Calculate All-Reduce communication time required for TP
+    # The activation tensor (seq_len * dim) is communicated
+    ar_len = batchsize if decoding_mode else seq_len
+    all_reduce_comm_size = ar_len * args.dim * 2 / 1024 / 1024  # fp16 = 2 bytes
+    all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
+
+    # 3. Calculate latency for each TP degree
+    tp_time = {}
+    for tp_degree in config.tp_list:
+        if tp_degree == 1:
+            tp_time[tp_degree] = total_single_gpu_time
+        else:
+            # Computation and load are split by TP, and communication cost is added
+            tp_time[tp_degree] = total_single_gpu_time / tp_degree + all_reduce_t
+    
+    if print_console:
+        print(f"[{gpu.gpu_type}] DenseMLP base time (TP=1): {total_single_gpu_time:.3f} ms")
+        print(f"[{gpu.gpu_type}] All-Reduce time: {all_reduce_t:.3f} ms")
+        for tp, time in tp_time.items():
+            print(f"[{gpu.gpu_type}] --> TP={tp}, Total time: {time:.3f} ms")
+
+    return total_single_gpu_time, tp_time
 
 def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, tp, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
@@ -672,7 +725,9 @@ def _prefill_time(args: ModelArgs, gpu, config: Config, seq_len, kv_cache_rate, 
     else:
         raise ValueError(f"Unsupported attention type: {args.attention}")
 
-    dense_mlp = _prefill_dense_mlp(args, gpu, seq_len, tp)
+    _, tp_mlp_dict = densmlp_elapse_time(args, gpu, config, seq_len, decoding_mode=False)
+    # Get the specific, TP-aware MLP time
+    dense_mlp = tp_mlp_dict.get(tp)
 
     # MoE-only parts ; skip when not MoE
     if args.is_moe:
