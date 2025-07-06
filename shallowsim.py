@@ -964,15 +964,14 @@ def decode_batchsize(args: ModelArgs, gpu_dict, config: Config, seq_len, decode_
 
 # has TP
 def decode_mla(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
-    df = pd.DataFrame(columns=['GPU', 'BatchSize',
-                           'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'LoadKV', 'Attn_TP1', 'Attn_TPN'])
     for key in gpu_dict.keys():
         for bs in bs_list:
             kv_cache = seq_len * (args.kv_lora_rank +
                                   args.qk_rope_head_dim) * bs
             load_kv_time = kv_cache / 1024/1024 / \
                 1024 / gpu_dict[key].get_mem_bw() * 1000
-            dense_mla, sparse_mla = mla_elapse_time(args, gpu_dict[key], config,
+            attn_tp1_time, attn_tpn_dict = mla_elapse_time(args, gpu_dict[key], config,
                                                     seq_len, kv_cache_rate=1,
                                                     batchsize=bs,
                                                     decoding_mode=True,
@@ -984,7 +983,7 @@ def decode_mla(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, deco
                     continue
                 else:
                     df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
-                                       load_kv_time, dense_mla, sparse_mla.get(tp_num)]
+                                       load_kv_time, attn_tp1_time, attn_tpn_dict.get(tp_num)]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
@@ -995,7 +994,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, deco
     """
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
-    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA','SparseGQA'])
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'LoadKV', 'Attn_TP1', 'Attn_TPN'])
 
     for key, gpu in gpu_dict.items():
         for bs in bs_list:
@@ -1005,7 +1004,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, deco
             load_kv = kv_bytes / 1024/1024 / 1024 / gpu.get_mem_bw() * 1000  # ms
 
             # --- Attention kernel ---
-            dense_gqa, sparse_gqa = gqa_elapse_time(
+            attn_tp1_time, attn_tpn_dict = gqa_elapse_time(
                 args, gpu, config, seq_len, 1.0,
                 batchsize=bs, decoding_mode=True)
             for tp in config.tp_list:
@@ -1014,7 +1013,7 @@ def decode_gqa(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, deco
                 if bs > max_bs:
                     continue
                 else:
-                    df.loc[len(df)] = [key, bs, tp, load_kv, dense_gqa, sparse_gqa.get(tp)]
+                    df.loc[len(df)] = [key, bs, tp, load_kv, attn_tp1_time, attn_tpn_dict.get(tp)]
     
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
@@ -1022,22 +1021,30 @@ def decode_gqa(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, deco
     return df
 
 # has TP
-def decode_dense_mlp(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
-    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
-    for key in gpu_dict.keys():
+def decode_dense_mlp(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, expert_num=0, print_console=False):
+    df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'MLP_TPN'])
+    for key, gpu in gpu_dict.items():
         for bs in bs_list:
-            t = _prefill_dense_mlp(args, gpu_dict[key], bs, 1) # for decode, seq_len = 1(per token generation) * bs
+            # Call the TP-aware function once per batch size to get all TP results
+            _, tp_mlp_dict = densmlp_elapse_time(
+                args, gpu, config,
+                seq_len=seq_len,      # This parameter is unused in decoding mode
+                decoding_mode=True,
+                batchsize=bs
+            )
+            
             for tp_num in config.tp_list:
                 max_bs = _decoding_batchsize(
-                    args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
-                if bs > max_bs:
-                    continue
-                else:
-                    df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num, t]
+                    args, gpu, seq_len, decode_len, expert_num=expert_num, tp=tp_num)
+                if bs <= max_bs:
+                    # Get the correct time for the current tp_num from the dictionary
+                    mlp_time = tp_mlp_dict.get(tp_num)
+                    df.loc[len(df)] = [gpu.gpu_type, bs, tp_num, mlp_time]
+    
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
-        print(df[df['TP'] == 1][['GPU', 'BatchSize', 'DenseMLP']
-                                ].set_index('GPU').to_markdown(floatfmt=".3f"))
+        print(df.to_markdown(floatfmt=".3f"))
+
     return df
 
 
@@ -1206,7 +1213,7 @@ def decode_a2a(args: ModelArgs, gpu_dict, config: Config,
 
 
 def _decode_time(args: ModelArgs,
-                 gpu: GPU_perf,
+                 gpu_dict: dict,
                  config: Config,
                  bs_list,
                  seq_len,
@@ -1214,82 +1221,43 @@ def _decode_time(args: ModelArgs,
                  gemm_group_per_device,
                  device_num,
                  mbs: int = 2,
-                 fp8_combine: bool = False,
-                 print_console: bool = False):
+                 fp8_combine: bool = False):
+    """
+    [Data Aggregator] Calls all component timing functions and merges them into a single DataFrame.
+    """
+    # 1. Get Attention timings
+    if args.attention == 'gqa':
+        attn_df = decode_gqa(args, gpu_dict, config, bs_list, seq_len, decode_len)
+    else: # default mla
+        # expert_num is only for memory calculation, can be 0 for dense parts
+        attn_df = decode_mla(args, gpu_dict, config, bs_list, seq_len, decode_len, expert_num=0)
 
-    # ------------------------------------------------------------
-    # Common helpers
-    # ------------------------------------------------------------
-    base_keys     = ['GPU', 'BatchSize', 'TP']   # merge keys
-    att_label     = args.attention.upper()  # MLA or GQA
-
-    # ============================================================
-    # 1.  NON-MoE   (pure dense, e.g. Llama-3)
-    # ============================================================
-    if not args.is_moe:
-        # 1-A  Attention  (includes Load-KV latency)
-        if args.attention == "gqa":
-            att_df = decode_gqa(args, gpu, config, bs_list, seq_len, decode_len)
-        else:      
-            att_df = decode_mla(args, gpu, config, bs_list, seq_len, decode_len, expert_num=0)      
-            
-        # 1-B  Dense-MLP
-        dmlp_df = decode_dense_mlp(args, gpu, config, bs_list, seq_len, decode_len,expert_num=0)
-
-        # 1-C  merge and zero-fill missing MoE/A2A columns
-        df = pd.merge(att_df[base_keys + ['LoadKV', 'Dense'+att_label]],
-                      dmlp_df[base_keys + ['DenseMLP']],
-                      on=base_keys, how='left')
-
-        # Dense-side:Sparse parts reset to 0
-        df['Sparse'+att_label] = 0.0
-        for col in ['SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine']:
-            df[col] = 0.0
-
-        col_order = ['GPU', 'BatchSize', 'TP',
-                     'LoadKV', 'Dense'+att_label, 'Sparse'+att_label, 'DenseMLP',
-                     'SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine']
-        df = df[col_order]
-        df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
-
-        if print_console:
-            print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
-        return df
-
-    # ============================================================
-    # 2.  MoE   (e.g. DeepSeek-V3, Qwen-3)
-    # ============================================================
-    expert_per_device = gemm_group_per_device + 1  # routed + shared
-
-    if args.attention == "mla":  # MLA kernel
-        attn_df  = decode_mla(args, gpu, config, bs_list, seq_len,decode_len, expert_num=expert_per_device)
-    elif args.attention == "gqa":  # GQA kernel
-        attn_df  = decode_gqa(args, gpu, config, bs_list, seq_len, decode_len, print_console=False)
+    # 2. Get MLP timings
+    dmlp_df = decode_dense_mlp(args, gpu_dict, config, bs_list, seq_len, decode_len, expert_num=0)
     
-    dmlp_df = decode_dense_mlp(args, gpu, config, bs_list, seq_len,
-                               decode_len, expert_num=expert_per_device)
-    moe_df  = decode_moe_expert(args, gpu, config, bs_list, seq_len,
-                                decode_len, mbs=mbs,
-                                gemm_group_per_device=gemm_group_per_device,
-                                device_num=device_num)
-    a2a_df  = decode_a2a(args, gpu, config, bs_list, seq_len, decode_len,
-                         expert_num=expert_per_device,
-                         device_num=device_num,
-                         fp8_combine=fp8_combine, mbs=mbs)
+    data_frames = [attn_df, dmlp_df]
+    
+    # 3. Get MoE timings if applicable
+    if args.is_moe:
+        expert_per_device = gemm_group_per_device + 1
+        moe_expert_df = decode_moe_expert(args, gpu_dict, config, bs_list, seq_len,
+                                          decode_len, mbs=mbs,
+                                          gemm_group_per_device=gemm_group_per_device,
+                                          device_num=device_num)
+        
+        a2a_df = decode_a2a(args, gpu_dict, config, bs_list, seq_len, decode_len,
+                            expert_num=expert_per_device, device_num=device_num,
+                            fp8_combine=fp8_combine, mbs=mbs)
+        data_frames.extend([moe_expert_df, a2a_df])
+        
+    # 4. Merge all component DataFrames into one
+    # Use an outer merge to prevent data loss if a calculation fails for a specific configuration
+    for decode_df in data_frames:
+        decode_df['BatchSize'] = decode_df['BatchSize'].astype(int).astype(str)
 
-    dfs = [attn_df, dmlp_df, moe_df, a2a_df]
-    for d in dfs:
-        d['BatchSize'] = d['BatchSize'].astype(int).astype(str)
-
-    df = reduce(lambda l, r: pd.merge(l, r,
-                                      on=['GPU', 'BatchSize', 'TP'],
-                                      how='left'), dfs)
-
-    if print_console:
-        print(df.set_index('GPU').to_markdown(floatfmt='.3f'))
-
-    return df
-
+    merged_df = reduce(lambda left, right: pd.merge(left, right, on=['GPU', 'BatchSize', 'TP'], how='left'), data_frames)
+    
+    return merged_df
 
 def decode_time(args: ModelArgs, gpu_dict, config: Config,
                 bs_list, seq_len, decode_len,
@@ -1297,52 +1265,84 @@ def decode_time(args: ModelArgs, gpu_dict, config: Config,
                 device_num,
                 tps_limit=0,
                 fp8_combine=False,
+                moe_decode_overlap_factor: float = 0.5,
                 print_console=False):
-
+    """
+    [Calculator] Calculates final per-token latency (TPOT) and throughput (TPS)
+    based on the aggregated data from _decode_time and the model architecture.
+    Includes a 'Comm_Time_Ratio' metric for bottleneck analysis.
+    """
+    # 1. Get the aggregated data. This part is correct and does not need changes.
     df = _decode_time(args, gpu_dict, config, bs_list, seq_len, decode_len,
                       gemm_group_per_device=gemm_group_per_device,
                       device_num=device_num,
                       fp8_combine=fp8_combine)
-# left TP in dense?
-    def overlap_adjust(r):
-        if r['Delta'] > 0:
-            return r['TPOT_O'] + r['Delta'] * (args.n_layers - args.n_dense_layers)
-        else:
-            return r['TPOT_O']
     
-    attn_type = args.attention.upper()
+    # 2. Define component timings from the DataFrame. This part is also correct.
+    attn_time = df['Attn_TPN'] + df['LoadKV']
+    mlp_time  = df['MLP_TPN']
 
+    # 3. Calculate latency based on the model's architecture. This logic is also correct.
+    time_per_dense_layer = attn_time + mlp_time
+    total_time_dense_layers = args.n_dense_layers * time_per_dense_layer
+    
+    total_time_sparse_layers = 0.0
+    overlapped_reduction = 0
     if args.is_moe:
-        # 修正TP执行时间, 按照加载FP8的KV计算
-        df['Dense'+ attn_type] = df['Dense'+ attn_type] + df['LoadKV']
-        df['Sparse'+ attn_type] = df['Sparse'+ attn_type] + df['LoadKV']
-        df['COMP_SUM'] = df['Sparse'+ attn_type] + df['SharedExpert'] + df['RoutedExpert']
-        df['COMM_SUM'] = df['Dispatch'] + df['Combine']
-        df['Delta'] = df['COMM_SUM'] - df['Sparse'+ attn_type] - df['SharedExpert']
-        df['TPOT_O'] = (df['Dense'+ attn_type] + df['DenseMLP']) * args.n_dense_layers
-        df['TPOT_O'] += (df['Sparse'+ attn_type] + df['SharedExpert'] +
-                        df['RoutedExpert']) * (args.n_layers - args.n_dense_layers)
-    else: # pure dense model, no moe communication
-        df['Dense'+ attn_type] = df['Dense'+ attn_type] + df['LoadKV']
-        df['COMP_SUM'] = df['Sparse'+ attn_type] + df['SharedExpert'] + df['RoutedExpert'] # 0
-        df['COMM_SUM'] = df['Dispatch'] + df['Combine'] # 0
-        df['Delta'] = df['COMM_SUM'] - df['Sparse'+ attn_type] - df['SharedExpert'] # 0
-        df['TPOT_O'] = (df['Dense'+ attn_type] + df['DenseMLP']) * args.n_dense_layers
+        moe_ffn_time = df['SharedExpert'] + df['RoutedExpert']
+        moe_comm_time = df['Dispatch'] + df['Combine']
+        n_sparse_layers = args.n_layers - args.n_dense_layers
+        if n_sparse_layers > 0:
+            comp1 = df['Attn_TPN'] + df['SharedExpert']
+            overlapped1 = np.minimum(comp1, df['Combine']) * moe_decode_overlap_factor
+            
+            comp2 = df['RoutedExpert']
+            overlapped2 = np.minimum(comp2, df['Dispatch']) * moe_decode_overlap_factor
+            
+            overlapped_reduction = overlapped1 + overlapped2
+            
+            time_per_sparse_layer = (attn_time + moe_ffn_time + moe_comm_time) - overlapped_reduction
+            total_time_sparse_layers = time_per_sparse_layer * n_sparse_layers
 
-
-    df['TPOT'] = df.apply(lambda row:  overlap_adjust(row), axis=1)
-    df = df[['GPU', 'TP', 'BatchSize', 'Dense'+ attn_type, 'DenseMLP', 'Sparse'+ attn_type, 'Combine',
-                'SharedExpert', 'RoutedExpert', 'Dispatch', 'COMP_SUM', 'COMM_SUM', 'Delta', 'TPOT', 'TPOT_O']]
+    df['TPOT'] = total_time_dense_layers + total_time_sparse_layers
     df['TPS'] = 1000 / df['TPOT']
-    df['TPS_O'] = 1000 / df['TPOT_O']
     df['Total'] = df['TPS'] * df['BatchSize'].astype(int)
-    df['Total_O'] = df['TPS_O'] * df['BatchSize'].astype(int)
-    df['Comm_Impact'] = (df['Total_O'] - df['Total']) / df['Total_O']
+    
+    # --- 4.1. Add detailed components for analysis ---
+    n_sparse_layers = args.n_layers - args.n_dense_layers
+    
+    # Total compute time = compute part of dense layers + compute part of sparse layers
+    df['ComputeTime'] = (time_per_dense_layer * args.n_dense_layers) + \
+                      ((attn_time + moe_ffn_time) * n_sparse_layers if args.is_moe else 0)
+    
+    # Total communication time (only from sparse layers)
+    df['CommTime'] = (moe_comm_time * n_sparse_layers if args.is_moe else 0)
+    
+    # Total time saved by overlap (only from sparse layers)
+    df['Overlapped'] = overlapped_reduction * n_sparse_layers if args.is_moe else 0
+
+    # --- 4.2. Calculate the new Comm_Time_Ratio metric ---
+    # Net communication time is the part that was not hidden by computation
+    net_comm_time = df['CommTime'] - df['Overlapped']
+    # The ratio of net communication time to the total time
+    # This robustly handles division by zero if TPOT is 0
+    df['Comm_Time_Ratio'] = np.divide(net_comm_time, df['TPOT'], 
+                                    out=np.zeros_like(net_comm_time, dtype=float), 
+                                    where=df['TPOT']!=0)
 
     df = df[df['TPS'] > tps_limit]
 
     if print_console:
-        print(df.set_index('GPU').T.to_markdown(floatfmt=".3f"))
+        output_cols = ['GPU', 'TP', 'BatchSize', 'Attn_TPN', 'MLP_TPN']
+        if args.is_moe:
+            output_cols.extend(['SharedExpert', 'RoutedExpert', 'Dispatch', 'Combine', 'Overlapped'])
+        output_cols.extend(['TPOT', 'Comm_Time_Ratio', 'TPS', 'Total'])
+
+        for col in output_cols:
+            if col not in df.columns:
+                df[col] = 0.0
+        print(df[output_cols].set_index(['GPU', 'BatchSize', 'TP']).to_markdown(floatfmt=".3f"))
+
     return df
 
 
