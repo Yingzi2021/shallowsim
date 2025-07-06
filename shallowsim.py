@@ -110,6 +110,7 @@ class Config:
     decode_len = 100 # tokens to generate
     kv_cache_rate = 0.563
     tp_list = [1, 2, 4, 8]  # Centralized TP configuration
+    dp_list=[1, 2, 4, 8]
     bs_list = [1, 8, 16]
     eplist = [8, 16, 36, 72, 144, 320]
     
@@ -653,14 +654,12 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
     return shared_time, routed_time
 
 # has TP/DP 
-def prefill_moe(args: ModelArgs, gpu_dict, config: Config, seq_len,
-                dp_list=[4, 8, 9],
-                print_console=False):
+def prefill_moe(args: ModelArgs, gpu_dict, config: Config, seq_len, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'DP',
                           'Shared Expert', 'Routed Expert'])
     for key in gpu_dict.keys():
         for tp in config.tp_list:
-            for dp in dp_list:
+            for dp in config.dp_list:
                 s, r = _prefill_moe(args, gpu_dict[key], seq_len, tp, dp)
                 df.loc[len(df)] = [gpu_dict[key].gpu_type, tp, dp, s, r]
     if print_console:
