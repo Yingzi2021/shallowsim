@@ -107,11 +107,12 @@ class ModelArgs:
 
 class Config:
     seq_len = 1024 # prompt length
-    decode_len = 100 # tokens to generate(only used to calculate decoding batchsize???)(TODO)(align)
+    decode_len = 100 # tokens to generate
     kv_cache_rate = 0.563
-    bs_list = [16, 32, 64, 128, 256, 512]
+    tp_list = [1, 2, 4, 8]  # Centralized TP configuration
+    bs_list = [1, 8, 16]
     eplist = [8, 16, 36, 72, 144, 320]
-    # move pp & micro_bs & tp_list to here?(TODO)
+    
 
 
 class GPU_perf:
@@ -301,17 +302,17 @@ def mla_mem(args: ModelArgs):
 
 # has TP/DP 
 def mla_elapse_time(args: ModelArgs,
-                    gpu: GPU_perf,
-                    seq_len,
-                    kv_cache_rate,
-                    tp=[1, 2, 4],
-                    decoding_mode=True,
-                    batchsize=1,
-                    enable_gemm_fp4=False,
-                    min_ar_time=0.015,  # Allreduce的静态延迟
-                    mla_discount=0.7,  # based on FlashMLA result on H800
-                    mla_kernel_static_time=0.05,
-                    print_console=False):
+                      gpu: GPU_perf,
+                      config: Config,
+                      seq_len,
+                      kv_cache_rate,
+                      decoding_mode=True,
+                      batchsize=1,
+                      enable_gemm_fp4=False,
+                      min_ar_time=0.015,  # Allreduce的静态延迟
+                      mla_discount=0.7,  # based on FlashMLA result on H800
+                      mla_kernel_static_time=0.05,
+                      print_console=False):
     if decoding_mode:
         # Decoding时计算为qlen=1, kv_cache_rate = 1
         _, gemm_flops, attn_fp16_flops = mla_matabsob_flops(
@@ -343,7 +344,7 @@ def mla_elapse_time(args: ModelArgs,
     all_reduce_t = all_reduce_comm_size / gpu.get_nvlink_bw() + min_ar_time
 
     tp_time = {}
-    for v in tp:
+    for v in config.tp_list:
         if v == 1:
             tp_time[v] = total
         else:
@@ -359,24 +360,28 @@ def mla_elapse_time(args: ModelArgs,
               (gpu.gpu_type, attn_fp16_t))
         print("[%8s]Total Elapsed time(ms):%.3f" % (gpu.gpu_type, total))
         print("[%8s]AR Elapsed time(ms):%.3f" % (gpu.gpu_type, all_reduce_t))
-        for v in tp:
-            print("[%8s]TP[%2d] Elapsed time(ms):%.3f" %
-                  (gpu.gpu_type, v, tp_time[v]))
+        for v in config.tp_list:
+            if v in tp_time:
+                print("[%8s]TP[%2d] Elapsed time(ms):%.3f" %
+                      (gpu.gpu_type, v, tp_time[v]))
 
     return total, tp_time
 
 
-def prefill_mla(args: ModelArgs, gpu_dict, seq_len, kv_cache_rate, print_console=False):
-    df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
+def prefill_mla(args: ModelArgs, gpu_dict, config: Config, seq_len, kv_cache_rate, print_console=False):
+    df = pd.DataFrame(columns=['GPU'] + [f'TP{tp}' for tp in config.tp_list])
     for key in gpu_dict.keys():
-        tp1, tp_list = mla_elapse_time(args, gpu_dict[key],
-                                       seq_len, kv_cache_rate,
-                                       tp=[2, 4],
-                                       decoding_mode=False,
-                                       enable_gemm_fp4=False,
-                                       print_console=print_console)
-        df.loc[len(df)] = [gpu_dict[key].gpu_type, tp1] + \
-            list(tp_list.values())
+        tp1, tp_list_res = mla_elapse_time(args, gpu_dict[key], config,
+                                           seq_len, kv_cache_rate,
+                                           decoding_mode=False,
+                                           enable_gemm_fp4=False,
+                                           print_console=print_console)
+        
+        row = [gpu_dict[key].gpu_type]
+        for tp in config.tp_list:
+             row.append(tp_list_res.get(tp, None)) # Use .get for safety
+        df.loc[len(df)] = row
+
     if print_console:
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
@@ -451,17 +456,17 @@ def gqa_mem(args: ModelArgs):
 
 # has TP/DP 
 def gqa_elapse_time(args: ModelArgs,
-                          gpu: GPU_perf,
-                          seq_len,
-                          kv_cache_rate,
-                          tp=[1, 2, 4],
-                          decoding_mode: bool=True,
-                          batchsize=1,
-                          enable_gemm_fp4=False,
-                          min_ar_time=0.015,
-                          gqa_discount=0.7, # need profile(TODO)
-                          gqa_kernel_static_time=0.05,
-                          print_console: bool = False):
+                        gpu: GPU_perf,
+                        config: Config,
+                        seq_len,
+                        kv_cache_rate,
+                        decoding_mode: bool=True,
+                        batchsize=1,
+                        enable_gemm_fp4=False,
+                        min_ar_time=0.015,
+                        gqa_discount=0.7, # need profile(TODO)
+                        gqa_kernel_static_time=0.05,
+                        print_console: bool = False):
     """
     Timing model for Dense-GQA Attention (no MoE).
 
@@ -496,7 +501,7 @@ def gqa_elapse_time(args: ModelArgs,
     ar_t    = ar_size / gpu.get_nvlink_bw() + min_ar_time
 
     tp_time = {}
-    for tp_degree in tp:
+    for tp_degree in config.tp_list:
         if tp_degree == 1:
             tp_time[tp_degree] = total
         else:
@@ -510,20 +515,24 @@ def gqa_elapse_time(args: ModelArgs,
     return total, tp_time
 
 
-def prefill_gqa(args: ModelArgs, gpu_dict: dict, seq_len, kv_cache_rate, print_console=False):
+def prefill_gqa(args: ModelArgs, gpu_dict: dict, config: Config, seq_len, kv_cache_rate, print_console=False):
     """
     Prefill attention latency for Dense-GQA models.
     """
-    df = pd.DataFrame(columns=['GPU', 'TP1', 'TP4', 'TP8'])
+    df = pd.DataFrame(columns=['GPU'] + [f'TP{tp}' for tp in config.tp_list])
     for key, gpu in gpu_dict.items():
-        tp1, tp_list = gqa_elapse_time(
-            args, gpu,
+        tp1, tp_list_res = gqa_elapse_time(
+            args, gpu, config,
             seq_len=seq_len,
             kv_cache_rate=kv_cache_rate,
-            tp=[1, 2, 4],
             decoding_mode=False,
             enable_gemm_fp4=False)
-        df.loc[len(df)] = [key, tp1] + list(tp_list.values())
+        
+        row = [key]
+        for tp in config.tp_list:
+            row.append(tp_list_res.get(tp, None))
+        df.loc[len(df)] = row
+
     if print_console:
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
@@ -537,7 +546,6 @@ def densmlp_mem(args: ModelArgs):
     return 3 * args.dim * args.inter_dim / 1024/1024
 
 
-# no TP
 def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, tp, print_console=False):
     gemm_flops = densmlp_flops(args, seq_len)
     if gpu.get_fp4_flops() != 0:
@@ -592,14 +600,13 @@ def _prefill_moe(args: ModelArgs, gpu: GPU_perf, seq_len, tp, dp):
     return shared_time, routed_time
 
 # has TP/DP 
-def prefill_moe(args: ModelArgs, gpu_dict, seq_len,
-                tp_list=[2, 4],
+def prefill_moe(args: ModelArgs, gpu_dict, config: Config, seq_len,
                 dp_list=[4, 8, 9],
                 print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'DP',
-                      'Shared Expert', 'Routed Expert'])
+                          'Shared Expert', 'Routed Expert'])
     for key in gpu_dict.keys():
-        for tp in tp_list:
+        for tp in config.tp_list:
             for dp in dp_list:
                 s, r = _prefill_moe(args, gpu_dict[key], seq_len, tp, dp)
                 df.loc[len(df)] = [gpu_dict[key].gpu_type, tp, dp, s, r]
@@ -634,9 +641,9 @@ def _prefill_alltoall(args: ModelArgs, gpu, seq_len, tp, static_latency=0.05):
     return dispatch_time, combine_time
 
 # has TP
-def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
+def prefill_alltoall(args: ModelArgs, gpu_dict, config: Config, seq_len, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'TP', 'Dispatch', 'Combine'])
-    for tp in [2, 4]:
+    for tp in config.tp_list:
         for key in gpu_dict.keys():
             dispatch_time, combine_time = _prefill_alltoall(
                 args, gpu_dict[key], seq_len, tp)
@@ -647,21 +654,21 @@ def prefill_alltoall(args: ModelArgs, gpu_dict, seq_len, print_console=False):
     return df
 
 
-def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
-    if args.attention == "mla":        # MoE-MLA
-        dense_att, tp_att = mla_elapse_time(
-            args, gpu,
+def _prefill_time(args: ModelArgs, gpu, config: Config, seq_len, kv_cache_rate, tp, dp):
+    if args.attention == "mla":      # MoE-MLA
+        dense_att, tp_att_dict = mla_elapse_time(
+            args, gpu, config,
             seq_len, kv_cache_rate,
-            tp=[tp],
             decoding_mode=False,
             enable_gemm_fp4=False)
+        tp_att = tp_att_dict.get(tp)
     elif args.attention == "gqa":      # Dense-GQA
-        dense_att, tp_att = gqa_elapse_time(
-            args, gpu,
+        dense_att, tp_att_dict = gqa_elapse_time(
+            args, gpu, config,
             seq_len, kv_cache_rate,
-            tp=[tp],
             decoding_mode=False,
             enable_gemm_fp4=False)
+        tp_att = tp_att_dict.get(tp)
     else:
         raise ValueError(f"Unsupported attention type: {args.attention}")
 
@@ -674,11 +681,12 @@ def _prefill_time(args: ModelArgs, gpu, seq_len, kv_cache_rate, tp, dp):
     else:
         shared = routed = dispatch = combine = 0.0
 
-    return dense_att, dense_mlp, tp_att[tp], shared, combine, routed, dispatch
+    return dense_att, dense_mlp, tp_att, shared, combine, routed, dispatch
 
 
 def prefill_time(args: ModelArgs,
                  gpu_dict: dict,
+                 config: Config,
                  seq_len: int,
                  kv_cache_rate: float,
                  tp: int,
@@ -719,7 +727,7 @@ def prefill_time(args: ModelArgs,
     # ------------- PER-GPU CALCULATION ---------------------------
     for key, gpu in gpu_dict.items():
         attn, dmlp, tp_attn, shared, combine, routed, dispatch = _prefill_time(
-            args, gpu, seq_len, kv_cache_rate, tp, dp) 
+            args, gpu, config, seq_len, kv_cache_rate, tp, dp) 
 
         # ---- overlap only meaningful for MoE ----
         overlap1 = combine - (tp_attn + shared) if args.is_moe else 0.0
@@ -761,7 +769,6 @@ def prefill_time(args: ModelArgs,
 # ---------------------------------------------------------------------------
 # 3. Public – Prefill with PP
 # ---------------------------------------------------------------------------
-# todo: support bs_list somewhere? coherent with decode_time
 def prefill_time_pp(args: ModelArgs,
                     config: Config,
                     gpu_dict: dict,
@@ -776,7 +783,7 @@ def prefill_time_pp(args: ModelArgs,
     • `pp`        : pipeline degree (≥1)
     • `micro_bs`  : micro-batches that form one *global* batch
     """
-    detail, summary = prefill_time(args, gpu_dict, config.seq_len,
+    detail, summary = prefill_time(args, gpu_dict, config, config.seq_len,
                                    kv_cache_rate, tp, dp,
                                    print_console=False) # this function assumes batch size = 1
 
@@ -885,55 +892,55 @@ def _decoding_batchsize(args: ModelArgs,
 
 
 
-def decode_batchsize(args: ModelArgs, gpu_dict, seq_len, decode_len, tp):
+def decode_batchsize(args: ModelArgs, gpu_dict, config: Config, seq_len, decode_len):
     df = pd.DataFrame(columns=['GPU', 'EP320', 'EP144', 'EP72', 'EP34'])
     for key in gpu_dict.keys():
         item = key
         value = [item]
+        # This function seems to have a hardcoded assumption about expert parallelism (EP)
+        # and doesn't use tp_list from config. We will leave it as is.
         for exp_num in [2, 3, 5, 9]:
+            # Assuming tp=1 for this calculation as it's not specified
             bs = _decoding_batchsize(
-                args, gpu_dict[key], seq_len, decode_len, tp, exp_num)
+                args, gpu_dict[key], seq_len, decode_len, 1, exp_num)
             value.append(bs)
         df.loc[len(df)] = value
     print(df.set_index('GPU').to_markdown(floatfmt=".0f"))
     return df
 
 # has TP
-def decode_mla(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
+def decode_mla(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
-                      'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
-    tp_list = [1, 2, 4]
+                           'TP', 'LoadKV', 'DenseMLA', 'SparseMLA'])
     for key in gpu_dict.keys():
         for bs in bs_list:
             kv_cache = seq_len * (args.kv_lora_rank +
                                   args.qk_rope_head_dim) * bs
             load_kv_time = kv_cache / 1024/1024 / \
                 1024 / gpu_dict[key].get_mem_bw() * 1000
-            dense_mla, sparse_mla = mla_elapse_time(args, gpu_dict[key],
+            dense_mla, sparse_mla = mla_elapse_time(args, gpu_dict[key], config,
                                                     seq_len, kv_cache_rate=1,
-                                                    tp=tp_list,
                                                     batchsize=bs,
                                                     decoding_mode=True,
                                                     enable_gemm_fp4=False) # here.
-            for tp_num in tp_list:
+            for tp_num in config.tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
                 if bs > max_bs:
                     continue
                 else:
                     df.loc[len(df)] = [gpu_dict[key].gpu_type, bs, tp_num,
-                                       load_kv_time, dense_mla, sparse_mla[tp_num]]
+                                       load_kv_time, dense_mla, sparse_mla.get(tp_num)]
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
         print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
     return df
 
 # has TP
-def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_console=False):
+def decode_gqa(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, print_console=False):
     """
     Return DataFrame : GPU | BatchSize | TP | DenseGQA(ms)
     """
-    tp_list = [1, 2, 4]
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP','LoadKV', 'DenseGQA','SparseGQA'])
 
     for key, gpu in gpu_dict.items():
@@ -945,15 +952,15 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_co
 
             # --- Attention kernel ---
             dense_gqa, sparse_gqa = gqa_elapse_time(
-                args, gpu, seq_len, 1.0, tp=tp_list,
+                args, gpu, config, seq_len, 1.0,
                 batchsize=bs, decoding_mode=True)
-            for tp in tp_list:
+            for tp in config.tp_list:
                 max_bs = _decoding_batchsize(
-                        args, gpu, seq_len, decode_len,expert_num=0,tp=tp)
+                             args, gpu, seq_len, decode_len,expert_num=0,tp=tp)
                 if bs > max_bs:
                     continue
                 else:
-                    df.loc[len(df)] = [key, bs, tp, load_kv, dense_gqa, sparse_gqa[tp]]
+                    df.loc[len(df)] = [key, bs, tp, load_kv, dense_gqa, sparse_gqa.get(tp)]
     
     if print_console:
         df['BatchSize'] = df['BatchSize'].astype(int).astype(str)
@@ -961,13 +968,12 @@ def decode_gqa(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, print_co
     return df
 
 # has TP
-def decode_dense_mlp(args: ModelArgs, gpu_dict, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
-    tp_list = [1, 2, 4]  # only used for calc max batchsize
+def decode_dense_mlp(args: ModelArgs, gpu_dict, config: Config, bs_list, seq_len, decode_len, expert_num=2, print_console=False):
     df = pd.DataFrame(columns=['GPU', 'BatchSize', 'TP', 'DenseMLP'])
     for key in gpu_dict.keys():
         for bs in bs_list:
-            t = _prefill_dense_mlp(args, gpu_dict[key], bs) # for decode, seq_len = 1(per token generation) * bs
-            for tp_num in tp_list:
+            t = _prefill_dense_mlp(args, gpu_dict[key], bs, 1) # for decode, seq_len = 1(per token generation) * bs
+            for tp_num in config.tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], seq_len, decode_len, expert_num=expert_num, tp=tp_num)
                 if bs > max_bs:
@@ -1061,15 +1067,14 @@ def _decode_moe_expert(args: ModelArgs, gpu: GPU_perf, bs,
     return shared_time, routed_time
 
 # has TP
-def decode_moe_expert(args: ModelArgs, gpu_dict, 
+def decode_moe_expert(args: ModelArgs, gpu_dict, config: Config,
                       bs_list, seq_len, decode_len, 
                       gemm_group_per_device,
                       device_num,
                       mbs=2, 
                       print_console=False):
-    tp_list = [1, 2, 4]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
-                      'TP', 'SharedExpert', 'RoutedExpert'])
+                           'TP', 'SharedExpert', 'RoutedExpert'])
     for gpu_key in gpu_dict.keys():
         for bs in bs_list:
             s, r = _decode_moe_expert(
@@ -1078,7 +1083,7 @@ def decode_moe_expert(args: ModelArgs, gpu_dict,
                 device_num=device_num)
             s *= mbs
             r *= mbs
-            for tp_num in tp_list:
+            for tp_num in config.tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[gpu_key], seq_len, decode_len, 
                     expert_num= gemm_group_per_device+1, tp=tp_num)
@@ -1116,21 +1121,20 @@ def _moe_a2a(args: ModelArgs, gpu: GPU_perf, bs, expert_num, device_num, fp8_com
     return dispatch_t, combine_t
 
 # has TP
-def decode_a2a(args: ModelArgs, gpu_dict,
+def decode_a2a(args: ModelArgs, gpu_dict, config: Config,
                bs_list, seq_len, decode_len,
                expert_num, device_num,
                mbs=2,
                print_console=False, fp8_combine=False):
-    tp_list = [1, 2, 4]  # only used for calc max batchsize
     df = pd.DataFrame(columns=['GPU', 'BatchSize',
-                      'TP', 'Dispatch', 'Combine'])
+                           'TP', 'Dispatch', 'Combine'])
     for key in gpu_dict.keys():
         for bs in bs_list:
             dispatch_time, combine_time = _moe_a2a(
                 args, gpu_dict[key], bs, 
                 expert_num=expert_num, device_num=device_num, 
                 mbs=mbs, fp8_combine=fp8_combine)
-            for tp_num in tp_list:
+            for tp_num in config.tp_list:
                 max_bs = _decoding_batchsize(
                     args, gpu_dict[key], 
                     seq_len, decode_len, 
@@ -1149,6 +1153,7 @@ def decode_a2a(args: ModelArgs, gpu_dict,
 
 def _decode_time(args: ModelArgs,
                  gpu: GPU_perf,
+                 config: Config,
                  bs_list,
                  seq_len,
                  decode_len,
@@ -1161,9 +1166,8 @@ def _decode_time(args: ModelArgs,
     # ------------------------------------------------------------
     # Common helpers
     # ------------------------------------------------------------
-    base_keys       = ['GPU', 'BatchSize', 'TP']   # merge keys
-    att_label       = args.attention.upper()  # MLA or GQA
-    tp_list         = [1, 2, 4]                    # default TP sweep
+    base_keys     = ['GPU', 'BatchSize', 'TP']   # merge keys
+    att_label     = args.attention.upper()  # MLA or GQA
 
     # ============================================================
     # 1.  NON-MoE   (pure dense, e.g. Llama-3)
@@ -1171,12 +1175,12 @@ def _decode_time(args: ModelArgs,
     if not args.is_moe:
         # 1-A  Attention  (includes Load-KV latency)
         if args.attention == "gqa":
-            att_df = decode_gqa(args, gpu, bs_list, seq_len, decode_len)
-        else:         
-            att_df = decode_mla(args, gpu, bs_list, seq_len, decode_len, expert_num=0)        
+            att_df = decode_gqa(args, gpu, config, bs_list, seq_len, decode_len)
+        else:      
+            att_df = decode_mla(args, gpu, config, bs_list, seq_len, decode_len, expert_num=0)      
             
         # 1-B  Dense-MLP
-        dmlp_df = decode_dense_mlp(args, gpu, bs_list, seq_len, decode_len,expert_num=0)
+        dmlp_df = decode_dense_mlp(args, gpu, config, bs_list, seq_len, decode_len,expert_num=0)
 
         # 1-C  merge and zero-fill missing MoE/A2A columns
         df = pd.merge(att_df[base_keys + ['LoadKV', 'Dense'+att_label]],
@@ -1204,17 +1208,17 @@ def _decode_time(args: ModelArgs,
     expert_per_device = gemm_group_per_device + 1  # routed + shared
 
     if args.attention == "mla":  # MLA kernel
-        attn_df  = decode_mla(args, gpu, bs_list, seq_len,decode_len, expert_num=expert_per_device)
+        attn_df  = decode_mla(args, gpu, config, bs_list, seq_len,decode_len, expert_num=expert_per_device)
     elif args.attention == "gqa":  # GQA kernel
-        attn_df  = decode_gqa(args, gpu, bs_list, seq_len, decode_len, print_console=False)
+        attn_df  = decode_gqa(args, gpu, config, bs_list, seq_len, decode_len, print_console=False)
     
-    dmlp_df = decode_dense_mlp(args, gpu, bs_list, seq_len,
+    dmlp_df = decode_dense_mlp(args, gpu, config, bs_list, seq_len,
                                decode_len, expert_num=expert_per_device)
-    moe_df  = decode_moe_expert(args, gpu, bs_list, seq_len,
+    moe_df  = decode_moe_expert(args, gpu, config, bs_list, seq_len,
                                 decode_len, mbs=mbs,
                                 gemm_group_per_device=gemm_group_per_device,
                                 device_num=device_num)
-    a2a_df  = decode_a2a(args, gpu, bs_list, seq_len, decode_len,
+    a2a_df  = decode_a2a(args, gpu, config, bs_list, seq_len, decode_len,
                          expert_num=expert_per_device,
                          device_num=device_num,
                          fp8_combine=fp8_combine, mbs=mbs)
@@ -1233,7 +1237,7 @@ def _decode_time(args: ModelArgs,
     return df
 
 
-def decode_time(args: ModelArgs, gpu_dict,
+def decode_time(args: ModelArgs, gpu_dict, config: Config,
                 bs_list, seq_len, decode_len,
                 gemm_group_per_device,
                 device_num,
@@ -1241,7 +1245,7 @@ def decode_time(args: ModelArgs, gpu_dict,
                 fp8_combine=False,
                 print_console=False):
 
-    df = _decode_time(args, gpu_dict, bs_list, seq_len, decode_len,
+    df = _decode_time(args, gpu_dict, config, bs_list, seq_len, decode_len,
                       gemm_group_per_device=gemm_group_per_device,
                       device_num=device_num,
                       fp8_combine=fp8_combine)
@@ -1301,7 +1305,7 @@ def decode_time_with_ep_list(args: ModelArgs, gpu_dict,
     df_list = []
     for device_num in config.eplist:
         gemm_group_per_device = math.ceil(args.n_routed_experts / device_num)
-        df = decode_time(args, gpu_dict, config.bs_list, config.seq_len,
+        df = decode_time(args, gpu_dict, config, config.bs_list, config.seq_len,
                          config.decode_len,
                          gemm_group_per_device=gemm_group_per_device,
                          device_num=device_num,
@@ -1331,7 +1335,7 @@ def decode_time_pp(args: ModelArgs,
                    print_console: bool = False):
 
     # Base results without pipeline parallelism
-    df = decode_time(args, gpu_dict, config.bs_list, config.seq_len, config.decode_len,
+    df = decode_time(args, gpu_dict, config, config.bs_list, config.seq_len, config.decode_len,
                      gemm_group_per_device, device_num,
                      tps_limit=tps_limit,
                      fp8_combine=fp8_combine,
