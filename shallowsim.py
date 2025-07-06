@@ -746,76 +746,94 @@ def prefill_time(args: ModelArgs,
                  kv_cache_rate: float,
                  tp: int,
                  dp: int,
+                 moe_overlap_factor: float = 0.3, 
                  print_console: bool = False):
-    """
-    Returns
-    -------
-    detail_df : layer-wise timing table (rows = metrics / cols = GPU)
-    summary_df: summed compute / comm / total time (rows = metrics / cols = GPU)
-    """
-    att_col = args.attention.upper()  # MLA or GQA
+    att_col = args.attention.upper()
 
-    # ---------- 1.  column layout depends on model type ----------
-    if args.is_moe:                                          # MoE-MLA branch
-        col_order = ['GPU', att_col, 'DenseMLP', 'TP-'+att_col,
-                     'Shared Expert', 'Combine', 'Overlap1',
-                     'Routed Expert', 'Dispatch', 'Overlap2']
-    else:                                                    # Dense-GQA branch
-        col_order = ['GPU', att_col, 'DenseMLP', 'TP-'+att_col] 
+    # Define columns for the detailed breakdown table
+    if args.is_moe:
+        # Removed the old 'Overlap1' and 'Overlap2' columns
+        col_order = ['GPU', att_col, 'DenseMLP', f'TP-{att_col}',
+                     'Shared Expert', 'Combine',
+                     'Routed Expert', 'Dispatch']
+    else:
+        col_order = ['GPU', att_col, 'DenseMLP', f'TP-{att_col}']
 
-    detail_df  = pd.DataFrame(columns=col_order)
-    summary_df = pd.DataFrame(columns=['GPU', 'Compute', 'Comm', 'Sum'])
+    detail_df = pd.DataFrame(columns=col_order)
+    summary_df = pd.DataFrame(columns=['GPU', 'Compute', 'Comm', 'Overlapped', 'Sum'])
 
-    # layer split
     n_sparse_layers = args.n_layers - args.n_dense_layers
 
-    # ------------- HEADER ROW  (layer counts) --------------------
-    layer_row = ['Layers',
-                 args.n_dense_layers,          # MLA (dense attention)
-                 args.n_dense_layers,          # Dense MLP
-                 n_sparse_layers]              # TP-MLA (sparse att)
+    # Header row for layer counts in the detail table
+    layer_row = ['Layers', args.n_dense_layers, args.n_dense_layers, n_sparse_layers]
     if args.is_moe:
-        layer_row += [n_sparse_layers, n_sparse_layers, n_sparse_layers,
-                      n_sparse_layers, n_sparse_layers, n_sparse_layers]
+        layer_row += [n_sparse_layers, n_sparse_layers, n_sparse_layers, n_sparse_layers]
     detail_df.loc[len(detail_df)] = layer_row
 
-    # ------------- PER-GPU CALCULATION ---------------------------
+    # --- Per-GPU Calculation ---
     for key, gpu in gpu_dict.items():
-        attn, dmlp, tp_attn, shared, combine, routed, dispatch = _prefill_time(
-            args, gpu, config, seq_len, kv_cache_rate, tp, dp) 
+        # Get timings for individual components of a layer
+        # Assumes densmlp_elapse_time is now the standard function for MLP timing
+        _, tp_mlp_dict = densmlp_elapse_time(args, gpu, config, seq_len)
+        tp_dmlp = tp_mlp_dict.get(tp)
 
-        # ---- overlap only meaningful for MoE ----
-        overlap1 = combine - (tp_attn + shared) if args.is_moe else 0.0
-        overlap2 = dispatch - routed          if args.is_moe else 0.0
-
-        row = [key, attn, dmlp, tp_attn]
+        if args.attention == "gqa":
+            _, tp_att_dict = gqa_elapse_time(args, gpu, config, seq_len, kv_cache_rate)
+            tp_att = tp_att_dict.get(tp)
+        else: # default to mla
+            _, tp_att_dict = mla_elapse_time(args, gpu, config, seq_len, kv_cache_rate)
+            tp_att = tp_att_dict.get(tp)
+        
         if args.is_moe:
-            row += [shared, combine, overlap1, routed, dispatch, overlap2]
+            shared, routed = _prefill_moe(args, gpu, seq_len, tp, dp)
+            dispatch, combine = _prefill_alltoall(args, gpu, seq_len, tp)
+        else:
+            shared, routed, dispatch, combine = 0.0, 0.0, 0.0, 0.0
+
+        # Populate the detailed breakdown table
+        row = [key, tp_att, tp_dmlp, tp_att] # Note: first att_col is just a placeholder for consistency
+        if args.is_moe:
+            row += [shared, combine, routed, dispatch]
         detail_df.loc[len(detail_df)] = row
 
-        # ---- summary (per GPU) ---------------------------------
-        comp_time = args.n_dense_layers * (tp_attn + dmlp)
+        # --- Summary Calculation with New Overlap Logic ---
+        total_overlapped_reduction = 0.0
+        
+        # Base compute time is the sum of all computation components across all layers
+        comp_time = args.n_layers * (tp_att + tp_dmlp)
         if args.is_moe:
-            comp_time += n_sparse_layers * (tp_attn + shared + routed)
-
-        comm_time = n_sparse_layers * (combine + dispatch) if args.is_moe else 0.0
-        total_time = comp_time
+             comp_time += n_sparse_layers * (shared + routed)
+        
+        # Base communication time is the sum of all communication components
+        comm_time = 0.0
         if args.is_moe:
-            if overlap1 > 0:
-                total_time += overlap1 * n_sparse_layers
-            if overlap2 > 0:
-                total_time += overlap2 * n_sparse_layers
+            comm_time = n_sparse_layers * (combine + dispatch)
 
-        summary_df.loc[len(summary_df)] = [key, comp_time, comm_time, total_time]
+            # Calculate the time saved by overlapping
+            # Overlap opportunity 1: Combine (comm) with Attention + Shared Expert (comp)
+            comp1 = tp_att + shared
+            overlapped1 = min(comp1, combine) * moe_overlap_factor
+            
+            # Overlap opportunity 2: Dispatch (comm) with Routed Expert (comp)
+            comp2 = routed
+            overlapped2 = min(comp2, dispatch) * moe_overlap_factor
+            
+            total_overlapped_reduction = n_sparse_layers * (overlapped1 + overlapped2)
 
-    # ------------- formatting / print ----------------------------
-    detail_df  = detail_df.set_index('GPU').T
+        # Final time is the sum of all parts minus the overlapped portion
+        total_time = comp_time + comm_time - total_overlapped_reduction
+
+        summary_df.loc[len(summary_df)] = [key, comp_time, comm_time, total_overlapped_reduction, total_time]
+
+    # Formatting and printing
+    detail_df = detail_df.set_index('GPU').T
     summary_df = summary_df.set_index('GPU').T
 
     if print_console:
         detail_df['Layers'] = detail_df['Layers'].astype(int).astype(str)
+        print("--- Prefill Latency Breakdown (per-layer, ms) ---")
         print(detail_df.to_markdown(floatfmt=".3f"))
-        print('-----------SUM-------------')
+        print('\n--- Prefill Latency Summary (total, ms) ---')
         print(summary_df.to_markdown(floatfmt=".3f"))
 
     return detail_df, summary_df
