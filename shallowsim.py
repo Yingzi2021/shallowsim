@@ -618,31 +618,6 @@ def densmlp_elapse_time(args: ModelArgs,
 
     return total_single_gpu_time, tp_time
 
-def _prefill_dense_mlp(args: ModelArgs, gpu: GPU_perf, seq_len, tp, print_console=False):
-    gemm_flops = densmlp_flops(args, seq_len)
-    if gpu.get_fp4_flops() != 0:
-        gemm_time = gemm_flops / gpu.get_fp4_flops()
-    else:
-        gemm_time = gemm_flops / gpu.get_fp8_flops()
-
-    load_time = densmlp_mem(args) / gpu.get_mem_bw()
-    gemm_time = gemm_time/tp + load_time
-
-    # all-reduce time(TP)(TODO)
-
-    if print_console:
-        print("[%8s]Elapsed time(ms): %.3f" % (gpu.gpu_type, gemm_time))
-    return gemm_time
-
-
-def prefill_dense_mlp(args: ModelArgs, gpu_dict, seq_len, tp, print_console=False):
-    df = pd.DataFrame(columns=['GPU', 'DenseMLP'])
-    for key in gpu_dict.keys():
-        t = _prefill_dense_mlp(args, gpu_dict[key], seq_len, tp, print_console=print_console)
-        df.loc[len(df)] = [gpu_dict[key].gpu_type, t]
-    if print_console:
-        print(df.set_index('GPU').to_markdown(floatfmt=".3f"))
-    return df
 
 
 def moe_expert_flops(args: ModelArgs, seq_len):
@@ -1401,7 +1376,7 @@ def decode_time_pp(args: ModelArgs,
                    gpu_dict: dict,
                    gemm_group_per_device,
                    device_num,
-                   pp: int, micro_bs: int,
+                   pp: int, micro_bs_num: int,
                    tps_limit: int = 0,
                    fp8_combine: bool = False,
                    print_console: bool = False):
@@ -1413,36 +1388,35 @@ def decode_time_pp(args: ModelArgs,
                      fp8_combine=fp8_combine,
                      print_console=False)
 
-    if pp == 1:                       # PP disabled → nothing to add
+    if pp == 1:                      
         if print_console:
             print(df.set_index('GPU').T.to_markdown(floatfmt='.3f'))
         return df
 
-    # ----------------------------------------------------------------
-    # Iterate over every (GPU , BatchSize) row and patch PP metrics
-    # ----------------------------------------------------------------
     layers_per_stage = _uniform_split(args.n_layers, pp)
 
     for idx, row in df.iterrows():
-        bs  = int(row['BatchSize'])
         
-        serial_one = float(row['TPOT']) / bs # per-token, serial,with batch size = 1
-        micro_chunk = bs // micro_bs # per-token
+        bs = int(row['BatchSize'])
+        serial_latency_total = float(row['TPOT']) * bs
+        
+        num = min(bs, micro_bs_num)
+        per_micro_batch_serial_latency = serial_latency_total / num
 
-        stage_times = [serial_one * (l / args.n_layers)
+        stage_times = [per_micro_batch_serial_latency * (l / args.n_layers)
                        for l in layers_per_stage]
 
-        pp_per_token, bubble_per_token = _gpipe_latency(stage_times,micro_chunk)
-        total_pp = pp_per_token 
+        total_pp_latency, bubble_per_token = _gpipe_latency(stage_times,num)
+        tpot_pp = total_pp_latency / bs
 
         # ---- write back results -------------------------------------
         df.at[idx, 'PP']       = pp
         df.at[idx, 'Bubble']   = bubble_per_token
-        df.at[idx, 'TPOT_PP']  = total_pp
-        df.at[idx, 'Speedup']  = (serial_one * bs) / total_pp 
+        df.at[idx, 'TPOT_PP']  = tpot_pp
+        df.at[idx, 'Speedup']  = serial_latency_total / total_pp_latency 
 
     if print_console:
-        print("\n[Decode · Pipeline-parallel]")
+        print("\n[Decode · Pipeline-parallel with PP = {}]".format(pp))
         print(df.set_index('GPU').T.to_markdown(floatfmt='.3f'))
 
     return df
