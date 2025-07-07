@@ -212,24 +212,42 @@ def _uniform_split(total_layers: int, pp: int) -> List[int]:
     return [base + 1 if i < rem else base for i in range(pp)]
 
 
-def _gpipe_latency(stage_times: List[float], rounds: int,) -> Tuple[float, float]:
+def _gpipe_latency(
+    stage_times: List[float], 
+    num_micro_batches: int  # M: number of sequence chunks in prefill / number of micro-batches in decode stage
+) -> Tuple[float, float]:
     """
-    need args.decode_len/seq_len
-    stage_times : latency of each pipeline stage  (ms),assume batch size = 1
-    rounds      : number of chunks in 1 stage
-    ----------------------------------------------------------------
-    Returns (total_time_ms , bubble_time_ms)
+    Calculates the total latency and bubble time for a pipeline,
+    based on GPipe's batch-splitting algorithm. [cite: 10, 65]
+
+    Parameters
+    ----------
+    stage_times : List[float]
+        A list containing the execution time for each pipeline stage.
+    num_micro_batches : int
+        The number of micro-batches (or sequence chunks) the input is split into.
+
+    Returns
+    -------
+    Tuple[float, float]
+        (total_latency, bubble_time)
     """
-    pp = len(stage_times)
-    t_max = max(stage_times)
+    pp = len(stage_times) # pp
+    if pp <= 1:
+        return sum(stage_times) * num_micro_batches, 0.0
 
-    fill_drain = 2 * (pp - 1) * t_max 
+    # The bottleneck is the slowest stage in the pipeline.
+    slowest_stage_time = max(stage_times)
 
-    steady_overlap = (rounds - pp - 1) * t_max
-    total  = fill_drain + steady_overlap
-    bubble = fill_drain                       
+    # The pipeline runs for (M + K - 1) cycles of the slowest stage.
+    # M cycles for the steady state, and K - 1 cycles for the fill/drain phase. 
+    total_latency = (num_micro_batches + pp - 1) * slowest_stage_time
 
-    return total, bubble # for decode the result is per-token
+    # Bubble time is the difference between total pipeline latency and useful computation.
+    # Or more simply, it's the idle time during the fill and drain phases.
+    bubble_time = (pp - 1) * slowest_stage_time
+    
+    return total_latency, bubble_time
 
 
 # 非吸收的版本
@@ -833,67 +851,54 @@ def prefill_time(args: ModelArgs,
     return detail_df, summary_df
 
 
-# ---------------------------------------------------------------------------
-# 3. Public – Prefill with PP
-# ---------------------------------------------------------------------------
 def prefill_time_pp(args: ModelArgs,
                     config: Config,
                     gpu_dict: dict,
                     kv_cache_rate: float,
                     tp: int, dp: int,
-                    bs:int,
-                    pp: int, micro_bs: int,
+                    pp: int, 
+                    num_chunks: int,
                     print_console: bool = False):
     """
-    PP-aware drop-in replacement for `prefill_time`.
-
-    • `pp`        : pipeline degree (≥1)
-    • `micro_bs`  : micro-batches that form one *global* batch
+    • `pp`                  : pipeline degree (≥1)
+    • `num_chunks`         : number of chunks to split the sequence into. (PP -> chunked prefill)
     """
+
     detail, summary = prefill_time(args, gpu_dict, config, config.seq_len,
                                    kv_cache_rate, tp, dp,
-                                   print_console=False) # this function assumes batch size = 1
+                                   print_console=False) 
 
-    if pp == 1:                       # fast path – nothing to do
+    if pp == 1:
         if print_console:
             print(summary.to_markdown(floatfmt='.3f'))
         return detail, summary
 
-    L_per_stage = _uniform_split(args.n_layers, pp)
+    layers_per_stage = _uniform_split(args.n_layers, pp)
 
     for gpu_name in summary.columns:
-        # 1) serial latency of one prompt
-        serial_one = float(summary.at['Sum', gpu_name]) # serial time (with bs=1)
+        serial_latency_total = float(summary.at['Sum', gpu_name])
 
-        # 2) derive per-stage timing  (uniform split)
-        micro_chunk = bs // micro_bs             # ≥1
-        stage_times = [serial_one * (l / args.n_layers)
-                       for l in L_per_stage]
+        # 假设负载是均匀的，按层数比例分配
+        # 注意：这里需要将总时间除以 num_chunks，得到处理一个chunk的时间
+        per_chunk_serial_latency = serial_latency_total / num_chunks
+        
+        stage_times = [per_chunk_serial_latency * (l / args.n_layers)
+                       for l in layers_per_stage]
 
-        # ── pipeline latency for `micro_bs` chunks ─────────────────
-        total_pp, bubble = _gpipe_latency(stage_times, micro_chunk)
+        # 计算流水线总耗时
+        # 传入序列切分的总块数 num_chunks
+        total_pp_latency, bubble_time = _gpipe_latency(stage_times, num_chunks)
 
-        # 3) write Bubble / Total_PP rows
-        for row, val in (('Bubble',    bubble),
-                         ('Total_PP',  total_pp)):
-            if row not in summary.index:
-                summary.loc[row] = 0.0
-            summary.at[row, gpu_name] = val
-
-        # 4) serial_total & speed-up  (same GPU)
-        serial_total = serial_one * bs        # no PP baseline
-        speedup      = serial_total / total_pp 
-
-        for row, val in (('Serial_Total', serial_total),
-                         ('Speedup',      speedup)):
-            if row not in summary.index:
-                summary.loc[row] = 0.0
-            summary.at[row, gpu_name] = val
+        summary.at[f'Total_PP({pp=},M={num_chunks})', gpu_name] = total_pp_latency
+        summary.at[f'Bubble({pp=},M={num_chunks})', gpu_name] = bubble_time
+        summary.at[f'Speedup({pp=},M={num_chunks})', gpu_name] = serial_latency_total / total_pp_latency
 
     if print_console:
         print("\n[Prefill · Pipeline-parallel]")
         print(summary.to_markdown(floatfmt='.3f'))
+        
     return detail, summary
+
 
 # Decoding
 
