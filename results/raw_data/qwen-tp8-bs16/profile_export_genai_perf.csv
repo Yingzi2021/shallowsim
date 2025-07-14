@@ -1,0 +1,12 @@
+Metric,avg,min,max,p99,p95,p90,p75,p50,p25
+Time To First Token (ms),218.98,51.67,637.92,615.71,599.61,591.59,277.36,94.38,84.01
+Time To Second Token (ms),2.88,0.03,43.27,29.58,9.47,9.16,0.25,0.11,0.08
+Request Latency (ms),994.96,171.75,"1,512.79","1,510.41","1,420.68","1,290.93","1,078.21","1,017.23",953.01
+Inter Token Latency (ms),8.46,0.10,10.61,10.46,9.90,9.69,9.40,9.14,8.46
+Output Sequence Length (tokens),90.88,10.00,104.00,102.11,100.00,100.00,100.00,100.00,99.00
+Input Sequence Length (tokens),"1,024.00","1,024.00","1,024.00","1,024.00","1,024.00","1,024.00","1,024.00","1,024.00","1,024.00"
+
+Metric,Value
+Output Token Throughput (per sec),"1,277.88"
+Request Throughput (per sec),14.06
+Request Count (count),64.00
