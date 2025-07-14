@@ -71,7 +71,7 @@ class ModelArgs:
         model_name : str
             Which row to load.
         case_sensitive : bool, default False
-            Match 'model_name' in a case–insensitive way if False.
+            Match 'model_name' in a case-insensitive way if False.
         """
         import pandas as pd
         from pathlib import Path
